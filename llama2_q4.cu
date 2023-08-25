@@ -163,17 +163,20 @@ __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __res
     float sum = 0;
     for (int ygq = 0; ygq < packed_zeros_height; ygq++) {   // each iteration of this loop covers 8 x 128 elements in y dimension of weight matrix (weight matrix is column major)
         uint32_t packed_q_z = q_zeros[index * packed_zeros_height + ygq];
-        for (int qi = 0; qi < 8; qi += 2) {                 // each iteration of this loop covers 256 elements in y dimension of weight matrix
-            int group_y_base = ygq * 8 + qi;
-            int group_y = group_y_base + (threadIdx.x / 16);                    // First 16 threads of warp use first of the 2 groups, second set of 16 threads use the other
-            float q_z = (float)(packed_q_z >> (4 * (threadIdx.x / 16)) & 0xF);
-            packed_q_z = (packed_q_z >> 8);
-            float scale = (float)scales[index * scales_height + group_y];
 
-            // no loop here but because all warps are working in parallel, we cover 256 elements here (32 x 8 elements per thread)
-            int ys = group_y_base * 128 + (threadIdx.x * 8);
+        // load weights in one go (32 elements from weight matrix loaded by each thread in one read)
+        uint32_t loaded_packed_wts[4];
+        *((uint4*)(&loaded_packed_wts[0])) = *((uint4*)(&q_weight[index * packed_weights_height + ygq * 128 + threadIdx.x * 4]));
+
+        int group_y = ygq * 8 + (threadIdx.x / 4);
+        float q_z = (float)(packed_q_z >> (4 * (threadIdx.x / 4)) & 0xF);
+        float scale = (float)scales[index * scales_height + group_y];
+        int y_base = ygq * 1024 + threadIdx.x * 32;
+
+        for (int qi = 0; qi < 4; qi ++) {                 // each iteration of this loop covers 256 elements in y dimension of weight matrix
+            int ys = y_base + qi * 8;
             if (ys < inputElements) {
-                uint32_t packed_q_w = q_weight[index * packed_weights_height + ys / 8];
+                uint32_t packed_q_w = loaded_packed_wts[qi];
                 half ip[8];
                 *((uint4*)(&ip)) = *((uint4*)(&input[ys]));
 
