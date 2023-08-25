@@ -28,15 +28,10 @@ Inference for Llama-2 Transformer model in pure Cuda.
 #include <cub/cub.cuh>
 
 constexpr int group_size = 128; // hardcoded for this implementation
+#define DUMP_PER_TOKEN_TIMINGS 0
 
 // ----------------------------------------------------------------------------
 // GPU kernels
-
-__global__ void element_wise_add_kernel(half* dest, half* src, int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size)
-        dest[i] = (half)((float)dest[i] + (float)src[i]);
-}
 
 __global__ void convert_fp32_to_fp16(half* out, float* in, int elements) {
     int index = blockIdx.x * 256 + threadIdx.x;
@@ -154,7 +149,7 @@ __global__ void mat_vec_kernel_simple(half* op, half* ip, half* wt, int n, int d
 // hardcoded for group-count = 128
 __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __restrict__ input,
     const uint32_t* __restrict__ q_weight, const uint32_t* __restrict__ q_zeros, const half* __restrict__ scales,
-    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height)
+    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum)
 {
     int index = blockIdx.x * blockDim.y + threadIdx.y;
     if (index >= opElements)
@@ -194,8 +189,11 @@ __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __res
     __shared__ typename WarpReduce::TempStorage temp;
     sum = WarpReduce(temp).Sum(sum);
 
-    if (threadIdx.x == 0)
+    if (threadIdx.x == 0) {
+        if (accum)
+            sum += (float)output[index];
         output[index] = (half)sum;
+    }
 }
 
 // Here we make use of shared memory to achieve better memory access pattern, and transpose a 32x32 chunk of the matrix on the fly
@@ -545,12 +543,6 @@ int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f) {
 // ----------------------------------------------------------------------------
 // neural net blocks
 
-void accum(half* a, half* b, int size) {
-    int blocks = divUp(size, 256);
-    element_wise_add_kernel <<< blocks, 256 >>> (a, b, size);
-}
-
-
 void rmsnorm(half* o, half* x, half* weight, int size) {
     int elementsPerThread = divUp(size, 1024);
     rmsnorm_kernel <<< 1, 1024 >>> (o, x, weight, size, elementsPerThread);
@@ -568,7 +560,7 @@ void matmul(half* xout, half* x, half* w, int n, int d, int batch = 1, int x_str
         mat_vec_kernel <<<grid_dim, block_dim >>> (xout, x, w, n, d, serialLoads, x_stride, w_stride, op_stride, w_row_stride, alpha);
 }
 
-void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize) {
+void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false) {
     if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(1); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
@@ -576,7 +568,7 @@ void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize) {
     int packed_zeros_height = divUp(scales_height, 8);
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(opSize, 4), 1);
-    mat_vec_kernel_int4 <<<grid_dim, block_dim >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height);
+    mat_vec_kernel_int4 <<<grid_dim, block_dim >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum);
 }
 
 void RoPERotation(half *q, half *k, int num_heads, int head_size, int pos) {
@@ -612,12 +604,12 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int hidden_dim = p->hidden_dim;
     int head_size = dim / p->n_heads;
 
-    /*
+#if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
-    */
+#endif
 
     // copy the token embedding into x
     half* content_row = &(w->token_embedding_table[token * dim]);
@@ -646,11 +638,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // apply MHA using the query and the key-value cache
         MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, pos+1);
 
-        // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->layers[l].wq_o, dim, dim);
-
-        // residual connection back into x
-        accum(x, s->xb2, dim);
+        // final matmul to get the output of the attention fused with residual connection back into x
+        matmul(s->x, s->xb, w->layers[l].wq_o, dim, dim, true);
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->layers[l].rms_ffn_weight, dim);
@@ -662,10 +651,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // apply F.silu activation on hb and multiply it with hb2
         siluElementwiseMul(s->hb, s->hb2, hidden_dim);
 
-        matmul(s->xb, s->hb, w->layers[l].wq_down, hidden_dim, dim);
-
-        // residual connection
-        accum(x, s->xb, dim);
+        matmul(s->x, s->hb, w->layers[l].wq_down, hidden_dim, dim, true);
     }
 
     // final rmsnorm
@@ -676,8 +662,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
     // copy logits from GPU->CPU
     convert_fp16_to_fp32 <<<divUp(p->vocab_size, 256), 256 >>> (s->logits_temp, s->logits_gpu, p->vocab_size);
-
-    /*
+    
+#if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float time = 0;
@@ -685,8 +671,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     printf(" t: %g ", time);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    */
-
+#endif
     cudaMemcpy(s->logits, s->logits_temp, p->vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
