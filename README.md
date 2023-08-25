@@ -16,7 +16,7 @@ Based on llama2.c (https://github.com/karpathy/llama2.c/)
 
 3. Convert/repack the weight binary files using the weight_repacker.cpp utility.
 
-4. Run this program pointing to the final weight file.
+4. Run the inference (llama2_q4.cu) pointing to the final weight file.
 
 ## Sample output and performance
 We get ~200 tokens per second with RTX 4090 for 7b paramater models:
