@@ -34,16 +34,14 @@ constexpr int group_size = 128; // hardcoded for this implementation
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-__global__ void convert_fp32_to_fp16(half* out, float* in, int elements) {
-    int index = blockIdx.x * 256 + threadIdx.x;
-    if (index < elements)
-        out[index] = (half)in[index];
-}
-
-__global__ void convert_fp16_to_fp32(float* out, half* in, int elements) {
-    int index = blockIdx.x * 256 + threadIdx.x;
-    if (index < elements)
-        out[index] = (float)in[index];
+__global__ void copy_embedding_kernel(half* x, const half* __restrict__ table, int size, int* tokens, int* pPos)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) return;
+    int pos = *pPos;
+    int token = tokens[pos];
+    int table_index = index + token * size;
+    x[index] = table[table_index];
 }
 
 // Single block - not enough parallelism for the GPU, but it's just 1% of total time
@@ -83,9 +81,7 @@ __global__ void rmsnorm_kernel(half* o, half* x, half* weight, int size, int ele
 }
 
 
-// Note that ~95% of total time is spent here, so optimizing this is important
-// 1. One output generated per warp so that we can parallelize the dot product across the warp
-// 2. We load 8 elements at a time for efficiency (assume dimensions to be multiple of 8)
+// Only used for the final linear layer to get logits (for most other layers we use the INT4 version below)
 __global__ void mat_vec_kernel(half* op, const half* ip, const half* wt, int n, int d, int numSerialLoads, 
     int ip_stride, int w_stride, int op_stride, int w_row_stride, float alpha) {
     int index = blockIdx.x * blockDim.y + threadIdx.y;
@@ -118,7 +114,7 @@ __global__ void mat_vec_kernel(half* op, const half* ip, const half* wt, int n, 
         output[index] = (half)sum;
 }
 
-// Simpler version of the above - to handle non multiple of 8 dimensions too (needed for MHA block)
+// Simpler version of the above - handles non multiple of 8 dimensions too (used only by MHA block)
 __global__ void mat_vec_kernel_simple(half* op, half* ip, half* wt, int n, int numSerialElements,
     int ip_stride, int w_stride, int w_row_stride, float alpha, int *pPos) {
 
@@ -146,7 +142,6 @@ __global__ void mat_vec_kernel_simple(half* op, half* ip, half* wt, int n, int n
     if (threadIdx.x == 0)
         output[index] = (half)sum;
 }
-
 
 // hardcoded for group-count = 128
 __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __restrict__ input,
@@ -203,6 +198,7 @@ __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __res
 }
 
 // Here we make use of shared memory to achieve better memory access pattern, and transpose a 32x32 chunk of the matrix on the fly
+// Again used only by the MHA block
 __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half* __restrict__ wt, int N, int *pPos, int w_stride, int op_stride, int w_row_stride) {
     int K = *pPos + 1;
     const half* __restrict__ input = ip + blockIdx.y * K;
@@ -335,6 +331,53 @@ __global__ void silu_element_wise_mul_kernel(half* dest, half* src, int size) {
     }
 }
 
+__global__ void argmax_kernel(half* __restrict__ x, int size, int* result, volatile int* pPos, int* pPosGpu, bool write_token) {
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    __shared__ float shared_val;
+
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+
+    // find local max value and its position
+    float max_val = tid < size ? (float)x[tid] : -INFINITY;
+    int   max_pos = tid < size ? tid : 0;
+    for (int i = tid + step; i < size; i += step) {
+        if ((float)x[i] > max_val) {
+            max_val = x[i];
+            max_pos = i;
+        }
+    }
+
+    // find the global max value
+    float global_max_val;
+    global_max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    if (threadIdx.x == 0)
+        shared_val = global_max_val;
+    __syncthreads();
+    global_max_val = shared_val;
+
+    // possibility of race condition here, so we first write it to shared memory variable and then have just one thread to update the pointers.
+    __shared__ int global_max_pos;
+    if (max_val == global_max_val) {
+        global_max_pos = max_pos;
+    }
+    __syncthreads();
+
+    // write next token to the current token location
+    if (threadIdx.x == 0) {
+        int token_pos = *pPos;
+        token_pos++;
+
+        if (write_token)
+            result[token_pos] = global_max_pos;
+
+        // update the token indices (unblocks the CPU)
+        *pPos = token_pos;
+        *pPosGpu = token_pos;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
@@ -378,41 +421,47 @@ typedef struct {
     int num_layers;
 } TransformerWeights;
 
+// data shared between CPU and GPU (allocated in host memory)
+struct SharedData {
+    volatile int pos;         // current token index
+    int tokens[MAX_SEQ_LEN];  // seq_len (tokens processed/generated so far) allocated in host memory so that CPU can read this
+};
+
 typedef struct {
     // current wave of activations
     half* x; // activation at current time stamp (dim,)
     half* xb; // same, but inside a residual branch (dim,)
-    half* xb2; // an additional buffer just for convenience (dim,)
     half* hb; // buffer for hidden dimension in the ffn (hidden_dim,)
     half* hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
     half* q; // query (dim,)
     half* att; // buffer for scores/attention values (n_heads, seq_len)
-    half* logits_gpu; // output logits
-    float* logits_temp; // logits in GPU memory converted to float
-    float* logits; // logits copied CPU side
+    half* logits; // output logits
     // kv cache
     half* key_cache;   // (layer, seq_len, dim)
     half* value_cache; // (layer, seq_len, dim)
+
+    int* pos;  // GPU copy of the current position (just 1 element)
+    SharedData* shared_data;
 } RunState;
 
 void malloc_run_state(RunState* s, Config* p) {
     cudaMalloc((void**)&s->x, p->dim * sizeof(half));
     cudaMalloc((void**)&s->xb, p->dim * sizeof(half));
-    cudaMalloc((void**)&s->xb2, p->dim * sizeof(half));
     cudaMalloc((void**)&s->hb, p->hidden_dim * sizeof(half));
     cudaMalloc((void**)&s->hb2, p->hidden_dim * sizeof(half));
     cudaMalloc((void**)&s->q, p->dim * sizeof(half));
     cudaMalloc((void**)&s->att, p->n_heads * p->dim * sizeof(half));
-    cudaMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(half));
+    cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half));
     cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));    // potentially huge allocs
     cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));
-    cudaMalloc((void**)&s->logits_temp, p->vocab_size * sizeof(float));
-    s->logits = (float*)malloc(p->vocab_size * sizeof(float));
+
+    cudaMalloc((void**)&s->pos, sizeof(int));
+    cudaMallocHost((void**)&s->shared_data, sizeof(SharedData));
 
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
+    if (!s->x || !s->xb || !s->pos || !s->hb || !s->hb2 || !s->q
         || !s->att || !s->logits || !s->key_cache
-        || !s->value_cache || !s->logits_gpu || !s->logits_temp) {
+        || !s->value_cache || !s->shared_data) {
         printf("malloc failed for allocaing run state!\n");
         exit(1);
     }
@@ -421,16 +470,15 @@ void malloc_run_state(RunState* s, Config* p) {
 void free_run_state(RunState* s) {
     cudaFree(s->x);
     cudaFree(s->xb);
-    cudaFree(s->xb2);
+    cudaFree(s->pos);
     cudaFree(s->hb);
     cudaFree(s->hb2);
     cudaFree(s->q);
     cudaFree(s->att);
-    cudaFree(s->logits_gpu);
-    cudaFree(s->logits_temp);
-    free(s->logits);
+    cudaFree(s->logits);
     cudaFree(s->key_cache);
     cudaFree(s->value_cache);
+    cudaFreeHost(s->shared_data);
 }
 
 int divUp(int a, int b) {
@@ -608,6 +656,8 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w)
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
     int head_size = dim / p->n_heads;
+
+    copy_embedding_kernel <<<divUp(dim, 256), 256, 0, stream >>> (x, w->token_embedding_table, dim, s->shared_data->tokens, pPos);
     
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
@@ -649,21 +699,13 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w)
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);
-
-    // copy logits from GPU->CPU
-    convert_fp16_to_fp32 <<< divUp(p->vocab_size, 256), 256, 0, stream >>> (s->logits_temp, s->logits_gpu, p->vocab_size);
+    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
 }
 
 cudaGraphExec_t cudaGraphInstance;
 bool graphCaptured = false;
 
-void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
-
-    // a few convenience variables
-    half* x = s->x;
-    int dim = p->dim;
-
+void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -671,20 +713,12 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     cudaEventRecord(start, stream);
 #endif
 
-    // set the GPU side "pos" variable (used by MHA part to know current sequence length)
-    int* pPos = (int*)s->xb2;
-    cudaMemcpyAsync(pPos, &pos, sizeof(int), cudaMemcpyHostToDevice);
-
-    // copy the token embedding into x
-    half* content_row = &(w->token_embedding_table[token * dim]);
-    cudaMemcpyAsync(x, content_row, dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-
 #if USE_CUDA_GRAPHS
     if (!graphCaptured)
     {
         cudaGraph_t graph = {};
         cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-        run_llama_network(pPos, p, s, w);
+        run_llama_network(s->pos, p, s, w);
         cudaStreamEndCapture(stream, &graph);
         cudaGraphInstantiate(&cudaGraphInstance, graph, 0);
         cudaGraphDestroy(graph);
@@ -692,9 +726,12 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     }
     cudaGraphLaunch(cudaGraphInstance, stream);
 #else
-    run_llama_network(pPos, p, s, w);
+    run_llama_network(s->pos, p, s, w);
 #endif
-    
+
+    // sample the next token using greedy argmax sampling: take the token with the highest probability (not included in the graph because of gen_token variable)
+    argmax_kernel <<<1, 1024, 0, stream>>> (s->logits, p->vocab_size, &(s->shared_data->tokens[0]), &(s->shared_data->pos), s->pos, gen_token);
+
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEventRecord(stop, stream);
     cudaEventSynchronize(stop);
@@ -704,7 +741,6 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 #endif
-    cudaMemcpy(s->logits, s->logits_temp, p->vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 // ----------------------------------------------------------------------------
@@ -779,20 +815,7 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-int argmax(float* v, int n) {
-    // return argmax of v in elements 0..n
-    int max_i = 0;
-    float max_p = v[0];
-    for (int i = 1; i < n; i++) {
-        if (v[i] > max_p) {
-            max_i = i;
-            max_p = v[i];
-        }
-    }
-    return max_i;
-}
 // ----------------------------------------------------------------------------
-
 int main(int argc, char *argv[]) {
     // poor man's C argparse
     char *checkpoint = NULL;  // e.g. out/model.bin
@@ -875,39 +898,44 @@ int main(int argc, char *argv[]) {
             bpe_encode(input_message, vocab, vocab_scores, config.vocab_size, max_token_length, prompt_tokens, &num_prompt_tokens);
         }
 
+
         // start the main loop
-        long start = 0;  // used to time our code, only initialized after first iteration
-        int next;        // will store the next token in the sequence
-        int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
-        int pos = 0;     // position in the sequence
+        long start = time_in_ms();  // used to time our code
+        int next;                   // will store the next token in the sequence
+        int token = 1;              // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+        int pos = 0;                // position in the sequence
+
+        // copy the prompt tokens into shared list of tokens (so that GPU can access them).
+        // init state
+        cudaMemset(state.pos, 0, sizeof(int));
+        state.shared_data->pos = 0;
+        state.shared_data->tokens[0] = token;   // BOS
+        memcpy(&state.shared_data->tokens[1], prompt_tokens, sizeof(int) * num_prompt_tokens);
+
         printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
         while (pos < steps) {
+            // wait for GPU work for previous iteration to complete
+            // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
+            cudaStreamSynchronize(stream);
+            // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
+            transformer((pos + 1) >= num_prompt_tokens, &config, &state, &weights); // forward the transformer to get next token
 
-            // forward the transformer to get logits for the next token
-            transformer(token, pos, &config, &state, &weights);
+            if (pos > 0)
+            {
+                next = state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
 
-            if (pos < num_prompt_tokens) {
-                // if we are still processing the input prompt, force the next prompt token
-                next = prompt_tokens[pos];
+                // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
+                char* token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next] + 1 : vocab[next];
+                printf("%s", token_str);
+                //printf(" [%d - %s] ", next, token_str);
+                fflush(stdout);
+
+                if (next == 2) break; // break if EOS token is reached
+
+                // advance forward
+                token = next;
             }
-            else {
-                // sample the next token using greedy argmax sampling: take the token with the highest probability
-                next = argmax(state.logits, config.vocab_size);
-            }
-
-            // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
-            char* token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next] + 1 : vocab[next];
-            printf("%s", token_str);
-            //printf(" [%d - %s] ", next, token_str);
-            fflush(stdout);
-
-            if (next == 2) break; // break if EOS token is reached
-
-            // advance forward
-            token = next;
             pos++;
-            // init our timer here because the first iteration could be slow
-            if (start == 0) { start = time_in_ms(); }
         }
 
         // report achieved tok/s
