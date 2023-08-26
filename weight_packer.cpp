@@ -169,7 +169,7 @@ int main(int argc, char *argv[])
     sprintf(filename, "%s\\model.norm.weight.bin", input_dir);
     copyInputFileToFile(fp, filename, g_config.dim * sizeof(uint16_t));
 
-    for (int i = 0; i < 32; i++)
+    for (int i = 0; i < g_config.n_layers; i++)
     {
         printf("\nProcessing weights for layer: %d\n", i);
 
