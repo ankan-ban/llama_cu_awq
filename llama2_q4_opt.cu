@@ -918,7 +918,7 @@ int main(int argc, char *argv[]) {
             // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
             cudaStreamSynchronize(stream);
             // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
-            transformer((pos + 1) >= num_prompt_tokens, &config, &state, &weights); // forward the transformer to get next token
+            transformer(pos >= num_prompt_tokens, &config, &state, &weights); // forward the transformer to get next token
 
             if (pos > 0)
             {
