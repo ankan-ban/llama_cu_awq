@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 constexpr int group_size = 128;    // hardcoded as this implementation only supports 128
 
@@ -15,10 +16,52 @@ typedef struct {
     int seq_len; // max sequence length
 } Config;
 
-// Modify this as per params of the model
-// TODO: read from some sort of config file (maybe config.json of original huggingface model)
-Config g_config = { 4096, 11008, 32, 32, 32, 32000, 2048 };
 
+// extract config from config.json file
+void getConfig(Config* pConfig, char* json)
+{
+    char* p = strstr(json, "\"hidden_size\":");
+    if (!p) { printf("error parsing config.json hidden_size not found"); exit(1); }
+    p += strlen("\"hidden_size\":");
+    pConfig->dim = atoi(p);
+
+    p = strstr(json, "\"intermediate_size\":");
+    if (!p) { printf("error parsing config.json intermediate_size not found"); exit(1); }
+    p += strlen("\"intermediate_size\":");
+    pConfig->hidden_dim = atoi(p);
+
+    p = strstr(json, "\"num_hidden_layers\":");
+    if (!p) { printf("error parsing config.json num_hidden_layers not found"); exit(1); }
+    p += strlen("\"num_hidden_layers\":");
+    pConfig->n_layers = atoi(p);
+
+    p = strstr(json, "\"num_attention_heads\":");
+    if (!p) { printf("error parsing config.json num_attention_heads not found"); exit(1); }
+    p += strlen("\"num_attention_heads\":");
+    pConfig->n_heads = atoi(p);
+
+    p = strstr(json, "\"num_kv_heads\":");
+    if (!p) {
+        pConfig->n_kv_heads = pConfig->n_heads;
+    } else {
+        p += strlen("\"num_kv_heads\":");
+        pConfig->n_kv_heads = atoi(p);
+    }
+
+    p = strstr(json, "\"vocab_size\":");
+    if (!p) { printf("error parsing config.json vocab_size not found"); exit(1); }
+    p += strlen("\"vocab_size\":");
+    pConfig->vocab_size = atoi(p);
+
+    p = strstr(json, "\"max_position_embeddings\":");
+    if (!p) { printf("error parsing config.json max_position_embeddings not found"); exit(1); }
+    p += strlen("\"max_position_embeddings\":");
+    pConfig->seq_len = atoi(p);
+}
+
+
+// the model config
+Config g_config;
 
 void getFileContents(void* buf, char* filename, size_t bytes) {
     FILE* fp = fopen(filename, "rb");
@@ -143,12 +186,22 @@ void repackQWeightByName(FILE *fp, char* fileNameBase, const char* weightName, s
     free(scales_t);
 }
 
+char config_json[1024 * 1024];
 int main(int argc, char *argv[])
 {
-    if (argc != 3) { printf("usage: weight_packer <path_to_awq_bin_weights> <output_bin_filename>\n"); return 0; }
+    if (argc != 4) { printf("usage: weight_packer <config.json from huggingface> <path_to_awq_bin_weights> <output_bin_filename>\n"); return 0; }
 
-    char* input_dir = argv[1];
-    char* op_file_name = argv[2];
+    char *config_file_name = argv[1];
+    char* input_dir = argv[2];
+    char* op_file_name = argv[3];
+
+    // read the config file
+    FILE* fp_config;
+    fopen_s(&fp_config, config_file_name, "rb");
+    if (!fp_config) { printf("unable to open config file\n"); return 0; }
+    if(fread(config_json, 1, sizeof(config_json), fp_config) == 0) { printf("unable to read config file\n"); return 0; }
+    fclose(fp_config);
+    getConfig(&g_config, config_json);
 
     FILE* fp;
     fopen_s(&fp, op_file_name, "wb+");
