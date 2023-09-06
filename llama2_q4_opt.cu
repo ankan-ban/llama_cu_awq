@@ -153,7 +153,7 @@ __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __res
         return;
 
     float sum = 0;
-    for (int ygq = 0; ygq < packed_zeros_height; ygq++) {   // each iteration of this loop covers 8 x 128 elements in y dimension of weight matrix (weight matrix is column major)
+    for (int ygq = 0; ygq * 128 + threadIdx.x * 4 < packed_weights_height; ygq++) {   // each iteration of this loop covers 8 x 128 elements in y dimension of weight matrix (weight matrix is column major)
         uint32_t packed_q_z = q_zeros[index * packed_zeros_height + ygq];
 
         // load weights in one go (32 elements from weight matrix loaded by each thread in one read)
@@ -485,8 +485,16 @@ int divUp(int a, int b) {
     return (a - 1) / b + 1;
 }
 
+size_t getPackedWeightHeight(size_t height)
+{
+    // Each uint32 element in the packed weight matrix contain 8 elements from the original matrix.
+    // Also we load 4 uint's (32 elements) in a single instruction for getting better memory efficiency
+    // This requires us to align the "height" dimension to a multiple of 4 uint (or 32 elements)
+    return divUp(height, 32) * 4;
+}
+
 void allocQWeight(QWeight* pWeight, size_t height, size_t width) {
-    size_t packed_wt_height = divUp(height, 8);
+    size_t packed_wt_height = getPackedWeightHeight(height);
     size_t scales_height = divUp(height, group_size);
     size_t packed_zeros_height = divUp(scales_height, 8);
 
@@ -559,7 +567,7 @@ void readWeight(void* op, FILE* fp, size_t bytes, void* scratch) {
 
 void uploadQWeight(QWeight& weight, FILE* fp, size_t height, size_t width, void* scratch) {
     int meta_height = divUp(height, group_size);
-    int packed_wt_height = divUp(height, 8);
+    int packed_wt_height = getPackedWeightHeight(height);
     int packed_zeros_height = divUp(meta_height, 8);
 
     readWeight(weight.weight, fp, packed_wt_height * width * sizeof(uint32_t), scratch);
@@ -620,7 +628,7 @@ void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum
     if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(1); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
-    int packed_wt_height = divUp(inpSize, 8);
+    int packed_wt_height = getPackedWeightHeight(inpSize);
     int packed_zeros_height = divUp(scales_height, 8);
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(opSize, 4), 1);
