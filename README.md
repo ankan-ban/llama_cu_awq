@@ -1,28 +1,84 @@
 ## llama2_q4.cu
 
-Simple and fast Pure Cuda inference for 4-bit AWQ quantized models (https://github.com/mit-han-lab/llm-awq).
+Simple and fast Pure Cuda inference for 4-bit [AWQ](https://github.com/mit-han-lab/llm-awq) quantized models
 
-Based on llama2.c (https://github.com/karpathy/llama2.c/)
+Based on [llama2.c](https://github.com/karpathy/llama2.c)
 
-1. First generate AWQ int-4 quantized weights following steps in https://github.com/mit-han-lab/llm-awq
- E.g:
+## Instructions
+
+The simpler way is to download a pre-converted model from Huggingface, but you can also do all the steps
+
+### Using Huggingface
+
+You can use one of these models:
+
+* 7B: [Llama-2-7b-chat-hf-w4-g128-awq](https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g128-awq)
+* 13B: [Llama-2-13b-chat-hf-w4-g128-awq](https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq)
+
+Here are the commands for the 7B model:
+
 ```
-  python -m awq.entry --model_path /path-to-model/Llama-2-7b-chat-hf --w_bit 4 --q_group_size 128 --run_awq --dump_awq awq_cache/llama2-7b-chat-metadata.pt
-  python -m awq.entry --model_path /path-to-model/Llama-2-7b-chat-hf --w_bit 4 --q_group_size 128 --load_awq awq_cache/llama2-7b-chat-metadata.pt --q_backend real --dump_quant awq_weights/llama2-7b-awq.pt
-```
- Note - AWQ scripts doesn't run on Windows. Use Linux or WSL.
+git clone https://github.com/ankan-ban/llama_cu_awq
+gcc weight_packer.cpp -o weight_packer
+nvcc -O3 llama2_q4.cu -o llama2_q4
 
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g128-awq/resolve/main/pytorch_model.bin
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g128-awq/resolve/main/config.json
+
+python3 convert_awq_to_bin.py pytorch_model.bin output
+./weight_packer config.json output llama2-7b-awq-q4.bin
+
+./llama2_q4 llama2-7b-awq-q4.bin 256 "write an essay about GPUs"
+```
+
+And here are the commands for the 13B model:
+
+```
+git clone https://github.com/ankan-ban/llama_cu_awq
+gcc weight_packer.cpp -o weight_packer
+nvcc -O3 llama2_q4.cu -o llama2_q4
+
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/config.json
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/pytorch_model-00001-of-00003.bin
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/pytorch_model-00002-of-00003.bin
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/pytorch_model-00003-of-00003.bin
+
+python3 convert_awq_to_bin.py pytorch_model-00001-of-00003.bin output
+python3 convert_awq_to_bin.py pytorch_model-00002-of-00003.bin output
+python3 convert_awq_to_bin.py pytorch_model-00003-of-00003.bin output
+
+./weight_packer config.json output llama2-13b-awq-q4.bin
+
+./llama2_q4 llama2-13b-awq-q4.bin 256 "write an essay about GPUs"
+```
+
+
+### Converting yourself
+
+1. First generate AWQ int-4 quantized weights following steps in [llm-awq](https://github.com/mit-han-lab/llm-awq)
 2. Convert AWQ weights into individual weight binary files using convert_awq_to_bin.py
-
 3. Convert/repack the weight binary files using the weight_repacker.cpp utility.
-
 4. Run the inference (llama2_q4.cu) pointing to the final weight file.
 
+> Note: AWQ scripts doesn't run on Windows. Use Linux or WSL.
+
+Example:
+
+```
+python -m awq.entry --model_path /path-to-model/Llama-2-7b-chat-hf --w_bit 4 --q_group_size 128 --run_awq --dump_awq awq_cache/llama2-7b-chat-metadata.pt
+python -m awq.entry --model_path /path-to-model/Llama-2-7b-chat-hf --w_bit 4 --q_group_size 128 --load_awq awq_cache/llama2-7b-chat-metadata.pt --q_backend real --dump_quant awq_weights/llama2-7b-awq.pt
+
+python3 convert_awq_to_bin.py awq_weights/llama2-7b-awq.pt output
+./weight_packer config.json output llama2-7b-awq-q4.bin
+```
+
+
 ## Sample output and performance
+
 We get ~200 tokens per second with RTX 4090 for 7b paramater models:
 
 ```
-llama2_q4_opt.exe C:\LLM\llama2-7b-awq-q4.bin 256 "write an essay about GPUs"
+llama2_q4_opt.exe llama2-7b-awq-q4.bin 256 "write an essay about GPUs"
 
 Model params:-
 dim: 4096
@@ -46,6 +102,7 @@ The concept of a GPU can be traced back to the 1960s when computer graphics were
 Architecture
 achieved tok/s: 200.787402. Tokens: 255, seconds: 1.27
 ```
+
 ## License
 
 MIT
