@@ -197,14 +197,14 @@ int main(int argc, char *argv[])
 
     // read the config file
     FILE* fp_config;
-    fopen_s(&fp_config, config_file_name, "rb");
+    fp_config = fopen(config_file_name, "rb");
     if (!fp_config) { printf("unable to open config file\n"); return 0; }
     if(fread(config_json, 1, sizeof(config_json), fp_config) == 0) { printf("unable to read config file\n"); return 0; }
     fclose(fp_config);
     getConfig(&g_config, config_json);
 
     FILE* fp;
-    fopen_s(&fp, op_file_name, "wb+");
+    fp = fopen(op_file_name, "wb+");
     if (!fp) { printf("unable to open output file\n"); return 0; }
 
     // write the header
@@ -213,20 +213,20 @@ int main(int argc, char *argv[])
     char fileNameBase[512];
     char filename[512];
 
-    sprintf(filename, "%s\\model.embed_tokens.weight.bin", input_dir);
+    sprintf(filename, "%s/model.embed_tokens.weight.bin", input_dir);
     copyInputFileToFile(fp, filename, g_config.vocab_size * g_config.dim * sizeof(uint16_t));
 
-    sprintf(filename, "%s\\lm_head.weight.bin", input_dir);
+    sprintf(filename, "%s/lm_head.weight.bin", input_dir);
     copyInputFileToFile(fp, filename, g_config.vocab_size * g_config.dim * sizeof(uint16_t));
 
-    sprintf(filename, "%s\\model.norm.weight.bin", input_dir);
+    sprintf(filename, "%s/model.norm.weight.bin", input_dir);
     copyInputFileToFile(fp, filename, g_config.dim * sizeof(uint16_t));
 
     for (int i = 0; i < g_config.n_layers; i++)
     {
         printf("\nProcessing weights for layer: %d\n", i);
 
-        sprintf(fileNameBase, "%s\\model.layers.%d", input_dir, i);
+        sprintf(fileNameBase, "%s/model.layers.%d", input_dir, i);
 
         repackQWeightByName(fp, fileNameBase, "self_attn.q_proj", g_config.dim, g_config.dim);
         repackQWeightByName(fp, fileNameBase, "self_attn.k_proj", g_config.dim, g_config.dim);

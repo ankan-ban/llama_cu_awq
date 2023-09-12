@@ -28,4 +28,4 @@ if isinstance(data, dict):
       print(value.shape, value.dtype)
       # Dump the tensor to a binary file with the same name as the key in the given directory
       with open(os.path.join(dirname, key + '.bin'), 'wb') as f:
-        f.write(value.numpy().tobytes())
+        f.write(value.cpu().numpy().tobytes())

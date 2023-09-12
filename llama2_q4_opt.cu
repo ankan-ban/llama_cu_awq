@@ -220,7 +220,7 @@ __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half
     int n = start_n + threadIdx.x;
     int k = threadIdx.y;
     int offset = k * w_row_stride + n;
-    loaded_fragment[0][threadIdx.y][threadIdx.x] = ((n < N) && (k < K)) ? weight[offset] : 0;
+    loaded_fragment[0][threadIdx.y][threadIdx.x] = ((n < N) && (k < K)) ? weight[offset] : (half)0.0;
 
     float sum = 0;
     // Loop over the matrix row and vector elements
@@ -231,7 +231,7 @@ __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half
         if (start_k >= K) break;
         k = start_k + threadIdx.x;
         int buf_i = e & 1;
-        sum += float(loaded_fragment[buf_i][threadIdx.x][threadIdx.y]) * ((k < K) ? (float) input[k] : 0);
+        sum += float(loaded_fragment[buf_i][threadIdx.x][threadIdx.y]) * ((k < K) ? (float) input[k] : 0.0f);
 
         // load for the next iteration
         e++;
@@ -240,7 +240,7 @@ __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half
         n = start_n + threadIdx.x;
         k = start_k + threadIdx.y;
         int offset = k * w_row_stride + n;
-        loaded_fragment[buf_i][threadIdx.y][threadIdx.x] = ((n < N) && (k < K)) ? weight[offset] : 0;
+        loaded_fragment[buf_i][threadIdx.y][threadIdx.x] = ((n < N) && (k < K)) ? weight[offset] : (half)0.0;
     }
 
     using WarpReduce = cub::WarpReduce<float>;
@@ -961,7 +961,7 @@ int main(int argc, char *argv[]) {
         printf("\nachieved tok/s: %f. Tokens: %d, seconds: %g\n", timed_tokens / time, timed_tokens, time);
 
         printf("enter next prompt: ");
-        gets_s(input_message);
+        fgets(input_message, sizeof(input_message), stdin);
     }
 
     // memory cleanup
