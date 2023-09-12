@@ -15,7 +15,7 @@ You can use one of these models:
 * 7B: [Llama-2-7b-chat-hf-w4-g128-awq](https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g128-awq)
 * 13B: [Llama-2-13b-chat-hf-w4-g128-awq](https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq)
 
-Here is the example for the 7B model:
+Here are the commands for the 7B model:
 
 ```
 git clone https://github.com/ankan-ban/llama_cu_awq
@@ -26,9 +26,30 @@ wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g12
 wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g128-awq/resolve/main/config.json
 
 python3 convert_awq_to_bin.py pytorch_model.bin output
-weight_packer config.json output llama2-7b-awq-q4.bin
+./weight_packer config.json output llama2-7b-awq-q4.bin
 
 ./llama2_q4 llama2-7b-awq-q4.bin 256 "write an essay about GPUs"
+```
+
+And here are the commands for the 13B model:
+
+```
+git clone https://github.com/ankan-ban/llama_cu_awq
+gcc weight_packer.cpp -o weight_packer
+nvcc -O3 llama2_q4.cu -o llama2_q4
+
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/config.json
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/pytorch_model-00001-of-00003.bin
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/pytorch_model-00002-of-00003.bin
+wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/pytorch_model-00003-of-00003.bin
+
+python3 convert_awq_to_bin.py pytorch_model-00001-of-00003.bin output
+python3 convert_awq_to_bin.py pytorch_model-00002-of-00003.bin output
+python3 convert_awq_to_bin.py pytorch_model-00003-of-00003.bin output
+
+./weight_packer config.json output llama2-13b-awq-q4.bin
+
+./llama2_q4 llama2-13b-awq-q4.bin 256 "write an essay about GPUs"
 ```
 
 
