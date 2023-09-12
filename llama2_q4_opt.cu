@@ -659,7 +659,7 @@ void siluElementwiseMul(half *hb, half *hb2, int size) {
    silu_element_wise_mul_kernel <<< divUp(size, 256), 256, 0, stream >>> (hb, hb2, size);
 }
 
-void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w) {
+void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
     half* x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
@@ -686,7 +686,7 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w)
         RoPERotation(s->q, s->key_cache, p->n_heads, head_size, pPos, loff);
 
         // apply MHA using the query and the key-value cache
-        MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, p->seq_len, pPos);
+        MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, seq_len_bin, pPos);
 
         // final matmul to get the output of the attention fused with residual connection back into x
         matmul(s->x, s->xb, w->layers[l].wq_o, dim, dim, true);
@@ -710,8 +710,9 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w)
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
 }
 
-cudaGraphExec_t cudaGraphInstance;
-bool graphCaptured = false;
+#define MAX_GRAPHS 8
+cudaGraphExec_t cudaGraphInstance[MAX_GRAPHS];
+bool graphCaptured[MAX_GRAPHS];
 
 void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
@@ -721,20 +722,27 @@ void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w) 
     cudaEventRecord(start, stream);
 #endif
 
+    int seq_len = s->shared_data->pos + 1;
 #if USE_CUDA_GRAPHS
-    if (!graphCaptured)
+    int graphIndex;
+    int seq_len_bin = 128;
+    for (graphIndex = 0; graphIndex < MAX_GRAPHS - 1; seq_len_bin *= 2, graphIndex++)
+        if (seq_len <= seq_len_bin) break;
+    if ((seq_len > seq_len_bin) || (graphIndex == MAX_GRAPHS - 1)) seq_len_bin = p->seq_len;    // last bin holds max seq len
+
+    if (!graphCaptured[graphIndex])
     {
         cudaGraph_t graph = {};
         cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-        run_llama_network(s->pos, p, s, w);
+        run_llama_network(s->pos, p, s, w, seq_len_bin);
         cudaStreamEndCapture(stream, &graph);
-        cudaGraphInstantiate(&cudaGraphInstance, graph, 0);
+        cudaGraphInstantiate(&cudaGraphInstance[graphIndex], graph, 0);
         cudaGraphDestroy(graph);
-        graphCaptured = true;
+        graphCaptured[graphIndex] = true;
     }
-    cudaGraphLaunch(cudaGraphInstance, stream);
+    cudaGraphLaunch(cudaGraphInstance[graphIndex], stream);
 #else
-    run_llama_network(s->pos, p, s, w);
+    run_llama_network(s->pos, p, s, w, seq_len);
 #endif
 
     // sample the next token using greedy argmax sampling: take the token with the highest probability (not included in the graph because of gen_token variable)
