@@ -1097,7 +1097,11 @@ int main(int argc, char *argv[]) {
 
         printf("enter next prompt: ");
         fgets(input_message, sizeof(input_message), stdin);
-        input_message[strlen(input_message) - 1] = 0; // strip the new-line
+        // strip newline
+        size_t len = strlen(input_message);
+        if (len > 0 && input_message[len - 1] == '\n') {
+            input_message[len - 1] = '\0';
+        }
     }
 
     // memory cleanup
