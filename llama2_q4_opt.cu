@@ -967,6 +967,11 @@ int main(int argc, char *argv[]) {
     // memory cleanup
     free_run_state(&state);
     free_weights(&weights);
+#if USE_CUDA_GRAPHS
+    for (int i = 0; i < MAX_GRAPHS; i++)
+        if (graphCaptured[i]) cudaGraphExecDestroy(cudaGraphInstance[i]);
+#endif
+
     for (int i = 0; i < config.vocab_size; i++) { free(vocab[i]); }
     free(vocab);
     free(vocab_scores);
