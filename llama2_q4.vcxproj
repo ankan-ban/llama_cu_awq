@@ -84,6 +84,12 @@
   <ItemGroup>
     <CudaCompile Include="llama2_q4.cu" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="common.h" />
+    <ClInclude Include="gpu_kernels.h" />
+    <ClInclude Include="perplexity.h" />
+    <ClInclude Include="tokenizer.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 12.2.targets" />
