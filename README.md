@@ -28,7 +28,7 @@ wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g12
 python3 convert_awq_to_bin.py pytorch_model.bin output
 ./weight_packer config.json output llama2-7b-awq-q4.bin
 
-./llama2_q4 llama2-7b-awq-q4.bin 256 "write an essay about GPUs"
+./llama2_q4 llama2-7b-awq-q4.bin -n 256 -i "write an essay about GPUs"
 ```
 
 And here are the commands for the 13B model:
@@ -49,7 +49,7 @@ python3 convert_awq_to_bin.py pytorch_model-00003-of-00003.bin output
 
 ./weight_packer config.json output llama2-13b-awq-q4.bin
 
-./llama2_q4 llama2-13b-awq-q4.bin 256 "write an essay about GPUs"
+./llama2_q4 llama2-13b-awq-q4.bin -n 256 -i "write an essay about GPUs"
 ```
 
 
@@ -78,7 +78,7 @@ python3 convert_awq_to_bin.py awq_weights/llama2-7b-awq.pt output
 We get ~200 tokens per second with RTX 4090 for 7b paramater models:
 
 ```
-llama2_q4_opt.exe llama2-7b-awq-q4.bin 256 "write an essay about GPUs"
+llama2_q4_opt.exe llama2-7b-awq-q4.bin -n 256 -i "write an essay about GPUs"
 
 Model params:-
 dim: 4096
