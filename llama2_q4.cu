@@ -29,20 +29,25 @@ Inference for Llama-2 Transformer model in pure Cuda.
 
 constexpr int group_size = 128; // hardcoded for this implementation
 #define DUMP_PER_TOKEN_TIMINGS 0
+#define USE_CUDA_GRAPHS 1
 
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-__global__ void convert_fp32_to_fp16(half* out, float* in, int elements) {
-    int index = blockIdx.x * 256 + threadIdx.x;
-    if (index < elements)
-        out[index] = (half)in[index];
-}
-
 __global__ void convert_fp16_to_fp32(float* out, half* in, int elements) {
-    int index = blockIdx.x * 256 + threadIdx.x;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < elements)
         out[index] = (float)in[index];
+}
+
+__global__ void copy_embedding_kernel(half* x, const half* __restrict__ table, int size, int* tokens, int* pPos)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) return;
+    int pos = *pPos;
+    int token = tokens[pos];
+    int table_index = index + token * size;
+    x[index] = table[table_index];
 }
 
 // Single block - not enough parallelism for the GPU, but it's just 1% of total time
@@ -82,9 +87,7 @@ __global__ void rmsnorm_kernel(half* o, half* x, half* weight, int size, int ele
 }
 
 
-// Note that ~95% of total time is spent here, so optimizing this is important
-// 1. One output generated per warp so that we can parallelize the dot product across the warp
-// 2. We load 8 elements at a time for efficiency (assume dimensions to be multiple of 8)
+// Only used for the final linear layer to get logits (for most other layers we use the INT4 version below)
 __global__ void mat_vec_kernel(half* op, const half* ip, const half* wt, int n, int d, int numSerialLoads, 
     int ip_stride, int w_stride, int op_stride, int w_row_stride, float alpha) {
     int index = blockIdx.x * blockDim.y + threadIdx.y;
@@ -117,17 +120,18 @@ __global__ void mat_vec_kernel(half* op, const half* ip, const half* wt, int n, 
         output[index] = (half)sum;
 }
 
-// Simpler version of the above - to handle non multiple of 8 dimensions too (needed for MHA block)
-__global__ void mat_vec_kernel_simple(half* op, half* ip, half* wt, int n, int d, int numSerialElements,
-    int ip_stride, int w_stride, int op_stride, int w_row_stride, float alpha) {
+// Simpler version of the above - handles non multiple of 8 dimensions too (used only by MHA block)
+__global__ void mat_vec_kernel_simple(half* op, half* ip, half* wt, int n, int numSerialElements,
+    int ip_stride, int w_stride, int w_row_stride, float alpha, int *pPos) {
+
+    int op_stride = *pPos + 1;
+    int index = blockIdx.x * blockDim.y + threadIdx.y;
+    if (index >= op_stride)
+        return;
 
     const half* __restrict__ input = ip + blockIdx.y * ip_stride;
     const half* __restrict__ weight = wt + blockIdx.y * w_stride;
     half* output = op + blockIdx.y * op_stride;
-
-    int index = blockIdx.x * blockDim.y + threadIdx.y;
-    if (index >= d)
-        return;
 
     float sum = 0;
     for (int i = 0; i < numSerialElements; i++) {
@@ -145,30 +149,32 @@ __global__ void mat_vec_kernel_simple(half* op, half* ip, half* wt, int n, int d
         output[index] = (half)sum;
 }
 
-
 // hardcoded for group-count = 128
 __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __restrict__ input,
     const uint32_t* __restrict__ q_weight, const uint32_t* __restrict__ q_zeros, const half* __restrict__ scales,
-    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum)
+    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, int loff, int *pPos)
 {
     int index = blockIdx.x * blockDim.y + threadIdx.y;
     if (index >= opElements)
         return;
 
     float sum = 0;
-    for (int ygq = 0; ygq < packed_zeros_height; ygq++) {   // each iteration of this loop covers 8 x 128 elements in y dimension of weight matrix (weight matrix is column major)
+    for (int ygq = 0; ygq * 128 + threadIdx.x * 4 < packed_weights_height; ygq++) {   // each iteration of this loop covers 8 x 128 elements in y dimension of weight matrix (weight matrix is column major)
         uint32_t packed_q_z = q_zeros[index * packed_zeros_height + ygq];
-        for (int qi = 0; qi < 8; qi += 2) {                 // each iteration of this loop covers 256 elements in y dimension of weight matrix
-            int group_y_base = ygq * 8 + qi;
-            int group_y = group_y_base + (threadIdx.x / 16);                    // First 16 threads of warp use first of the 2 groups, second set of 16 threads use the other
-            float q_z = (float)(packed_q_z >> (4 * (threadIdx.x / 16)) & 0xF);
-            packed_q_z = (packed_q_z >> 8);
-            float scale = (float)scales[index * scales_height + group_y];
 
-            // no loop here but because all warps are working in parallel, we cover 256 elements here (32 x 8 elements per thread)
-            int ys = group_y_base * 128 + (threadIdx.x * 8);
+        // load weights in one go (32 elements from weight matrix loaded by each thread in one read)
+        uint32_t loaded_packed_wts[4];
+        *((uint4*)(&loaded_packed_wts[0])) = *((uint4*)(&q_weight[index * packed_weights_height + ygq * 128 + threadIdx.x * 4]));
+
+        int group_y = ygq * 8 + (threadIdx.x / 4);
+        float q_z = (float)(packed_q_z >> (4 * (threadIdx.x / 4)) & 0xF);
+        float scale = (float)scales[index * scales_height + group_y];
+        int y_base = ygq * 1024 + threadIdx.x * 32;
+
+        for (int qi = 0; qi < 4; qi ++) {                 // each iteration of this loop covers 256 elements in y dimension of weight matrix
+            int ys = y_base + qi * 8;
             if (ys < inputElements) {
-                uint32_t packed_q_w = q_weight[index * packed_weights_height + ys / 8];
+                uint32_t packed_q_w = loaded_packed_wts[qi];
                 half ip[8];
                 *((uint4*)(&ip)) = *((uint4*)(&input[ys]));
 
@@ -187,6 +193,10 @@ __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __res
     sum = WarpReduce(temp).Sum(sum);
 
     if (threadIdx.x == 0) {
+        if (loff != -1) {
+            output += loff + (*pPos * opElements);
+        }
+
         if (accum)
             sum += (float)output[index];
         output[index] = (half)sum;
@@ -194,10 +204,10 @@ __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __res
 }
 
 // Here we make use of shared memory to achieve better memory access pattern, and transpose a 32x32 chunk of the matrix on the fly
-__global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half* __restrict__ wt, int N, int K, int elementsPerThread,
-    int ip_stride, int w_stride, int op_stride, int w_row_stride) {
-
-    const half* __restrict__ input = ip + blockIdx.y * ip_stride;
+// Again used only by the MHA block
+__global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half* __restrict__ wt, int N, int *pPos, int w_stride, int op_stride, int w_row_stride) {
+    int K = *pPos + 1;
+    const half* __restrict__ input = ip + blockIdx.y * K;
     const half* __restrict__ weight = wt + blockIdx.y * w_stride;
     half* output = op + blockIdx.y * op_stride;
 
@@ -220,10 +230,11 @@ __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half
 
     float sum = 0;
     // Loop over the matrix row and vector elements
-    for (int e = 0; e < elementsPerThread;) {
+    for (int e = 0; ;) {
         __syncthreads();    // wait for the load
 
         int start_k = e * 32;
+        if (start_k >= K) break;
         k = start_k + threadIdx.x;
         int buf_i = e & 1;
         sum += float(loaded_fragment[buf_i][threadIdx.x][threadIdx.y]) * ((k < K) ? (float) input[k] : 0.0f);
@@ -247,7 +258,9 @@ __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half
 }
 
 // Each block processes a single head
-__global__ void RoPERotation_kernel(half* sq, half* sk, int num_heads, int head_size, int pos) {
+__global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_heads, int head_size, int *pPos, int loff) {
+    int pos = *pPos;
+    half* sk = sk_base + loff + pos * num_heads * head_size;
     int h = blockIdx.x;
     half* q = sq + h * head_size;
     half* k = sk + h * head_size;
@@ -268,11 +281,12 @@ __global__ void RoPERotation_kernel(half* sq, half* sk, int num_heads, int head_
 }
 
 #define MAX_SEQ_LEN 8192
-__global__ void softmax_kernel(half* __restrict__ arr, int num_heads, int size) {
+__global__ void softmax_kernel(half* __restrict__ arr, int num_heads, int *pPos) {
     __shared__ float att[MAX_SEQ_LEN];
     int h = blockIdx.x;
     int tid = threadIdx.x;
     int step = blockDim.x;
+    int size = *pPos + 1;
 
     // load input to shared memory
     for (int t = tid; t < size; t += step)
@@ -323,6 +337,53 @@ __global__ void silu_element_wise_mul_kernel(half* dest, half* src, int size) {
     }
 }
 
+__global__ void argmax_kernel(half* __restrict__ x, int size, int* result, volatile int* pPos, int* pPosGpu, bool write_token) {
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    __shared__ float shared_val;
+
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+
+    // find local max value and its position
+    float max_val = tid < size ? (float)x[tid] : -INFINITY;
+    int   max_pos = tid < size ? tid : 0;
+    for (int i = tid + step; i < size; i += step) {
+        if ((float)x[i] > max_val) {
+            max_val = x[i];
+            max_pos = i;
+        }
+    }
+
+    // find the global max value
+    float global_max_val;
+    global_max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    if (threadIdx.x == 0)
+        shared_val = global_max_val;
+    __syncthreads();
+    global_max_val = shared_val;
+
+    // possibility of race condition here, so we first write it to shared memory variable and then have just one thread to update the pointers.
+    __shared__ int global_max_pos;
+    if (max_val == global_max_val) {
+        global_max_pos = max_pos;
+    }
+    __syncthreads();
+
+    // write next token to the current token location
+    if (threadIdx.x == 0) {
+        int token_pos = *pPos;
+        token_pos++;
+
+        if (write_token)
+            result[token_pos] = global_max_pos;
+
+        // update the token indices (unblocks the CPU)
+        *pPos = token_pos;
+        *pPosGpu = token_pos;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
@@ -366,67 +427,90 @@ typedef struct {
     int num_layers;
 } TransformerWeights;
 
+// data shared between CPU and GPU (allocated in host memory)
+struct SharedData {
+    volatile int pos;         // current token index
+    int tokens[MAX_SEQ_LEN];  // seq_len (tokens processed/generated so far) allocated in host memory so that CPU can read this
+};
+
 typedef struct {
     // current wave of activations
     half* x; // activation at current time stamp (dim,)
     half* xb; // same, but inside a residual branch (dim,)
-    half* xb2; // an additional buffer just for convenience (dim,)
     half* hb; // buffer for hidden dimension in the ffn (hidden_dim,)
     half* hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
     half* q; // query (dim,)
     half* att; // buffer for scores/attention values (n_heads, seq_len)
-    half* logits_gpu; // output logits
-    float* logits_temp; // logits in GPU memory converted to float
-    float* logits; // logits copied CPU side
+    half* logits; // output logits
     // kv cache
     half* key_cache;   // (layer, seq_len, dim)
     half* value_cache; // (layer, seq_len, dim)
+
+    int* pos;  // GPU copy of the current position (just 1 element)
+    SharedData* shared_data;
+
+    float* logits_array;  // array of output logits used to compute perplexity (seq_len, vocab_size)
 } RunState;
 
-void malloc_run_state(RunState* s, Config* p) {
+void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
     cudaMalloc((void**)&s->x, p->dim * sizeof(half));
     cudaMalloc((void**)&s->xb, p->dim * sizeof(half));
-    cudaMalloc((void**)&s->xb2, p->dim * sizeof(half));
     cudaMalloc((void**)&s->hb, p->hidden_dim * sizeof(half));
     cudaMalloc((void**)&s->hb2, p->hidden_dim * sizeof(half));
     cudaMalloc((void**)&s->q, p->dim * sizeof(half));
     cudaMalloc((void**)&s->att, p->n_heads * p->dim * sizeof(half));
-    cudaMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(half));
+    cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half));
     cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));    // potentially huge allocs
     cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));
-    cudaMalloc((void**)&s->logits_temp, p->vocab_size * sizeof(float));
-    s->logits = (float*)malloc(p->vocab_size * sizeof(float));
+
+    cudaMalloc((void**)&s->pos, sizeof(int));
+    cudaMallocHost((void**)&s->shared_data, sizeof(SharedData));
 
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
+    if (!s->x || !s->xb || !s->pos || !s->hb || !s->hb2 || !s->q
         || !s->att || !s->logits || !s->key_cache
-        || !s->value_cache || !s->logits_gpu || !s->logits_temp) {
+        || !s->value_cache || !s->shared_data) {
         printf("malloc failed for allocaing run state!\n");
-        exit(1);
+        exit(EXIT_FAILURE);
+    }
+
+    if (allocLogitsArray) {
+        cudaMalloc((void**)&s->logits_array, p->seq_len * p->vocab_size * sizeof(float));
+        if (!s->logits_array) {
+            printf("malloc failed for allocaing logits_array!\n");
+            exit(EXIT_FAILURE);
+        }
     }
 }
 
 void free_run_state(RunState* s) {
     cudaFree(s->x);
     cudaFree(s->xb);
-    cudaFree(s->xb2);
+    cudaFree(s->pos);
     cudaFree(s->hb);
     cudaFree(s->hb2);
     cudaFree(s->q);
     cudaFree(s->att);
-    cudaFree(s->logits_gpu);
-    cudaFree(s->logits_temp);
-    free(s->logits);
+    cudaFree(s->logits);
     cudaFree(s->key_cache);
     cudaFree(s->value_cache);
+    cudaFreeHost(s->shared_data);
 }
 
 int divUp(int a, int b) {
     return (a - 1) / b + 1;
 }
 
+size_t getPackedWeightHeight(size_t height)
+{
+    // Each uint32 element in the packed weight matrix contain 8 elements from the original matrix.
+    // Also we load 4 uint's (32 elements) in a single instruction for getting better memory efficiency
+    // This requires us to align the "height" dimension to a multiple of 4 uint (or 32 elements)
+    return divUp(height, 32) * 4;
+}
+
 void allocQWeight(QWeight* pWeight, size_t height, size_t width) {
-    size_t packed_wt_height = divUp(height, 8);
+    size_t packed_wt_height = getPackedWeightHeight(height);
     size_t scales_height = divUp(height, group_size);
     size_t packed_zeros_height = divUp(scales_height, 8);
 
@@ -467,7 +551,7 @@ void malloc_weights(TransformerWeights* w, Config* p) {
     if (!w->token_embedding_table || !w->layers ||
         !w->rms_final_weight || !w->wcls) {
         printf("malloc failed!\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 }
 
@@ -493,13 +577,13 @@ void free_weights(TransformerWeights* w) {
 // ----------------------------------------------------------------------------
 // initialization: read from checkpoint
 void readWeight(void* op, FILE* fp, size_t bytes, void* scratch) {
-    if (fread(scratch, 1, bytes, fp) != bytes) { printf("error reading weights");  exit(1); }
+    if (fread(scratch, 1, bytes, fp) != bytes) { printf("error reading weights");  exit(EXIT_FAILURE); }
     cudaMemcpyAsync(op, scratch, bytes, cudaMemcpyHostToDevice);
 }
 
 void uploadQWeight(QWeight& weight, FILE* fp, size_t height, size_t width, void* scratch) {
     int meta_height = divUp(height, group_size);
-    int packed_wt_height = divUp(height, 8);
+    int packed_wt_height = getPackedWeightHeight(height);
     int packed_zeros_height = divUp(meta_height, 8);
 
     readWeight(weight.weight, fp, packed_wt_height * width * sizeof(uint32_t), scratch);
@@ -511,6 +595,8 @@ int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f) {
     size_t scratch_size = std::max(p->vocab_size, p->hidden_dim) * p->dim;
     scratch_size *= sizeof(half);
     void* scratchCpu = malloc(scratch_size);
+
+    printf("\nLoading Weights... ");
 
     readWeight(w->token_embedding_table, f, p->vocab_size * p->dim * sizeof(half), scratchCpu);
     readWeight(w->wcls, f, p->vocab_size * p->dim * sizeof(half), scratchCpu);
@@ -531,7 +617,7 @@ int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f) {
         readWeight(w->layers[i].rms_ffn_weight, f, p->dim * sizeof(half), scratchCpu);
     }
 
-    printf("\nloaded weights\n");
+    printf("done!\n");
     free(scratchCpu);
     return 0;
 }
@@ -539,79 +625,66 @@ int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f) {
 
 // ----------------------------------------------------------------------------
 // neural net blocks
+cudaStream_t stream;
 
 void rmsnorm(half* o, half* x, half* weight, int size) {
     int elementsPerThread = divUp(size, 1024);
-    rmsnorm_kernel <<< 1, 1024 >>> (o, x, weight, size, elementsPerThread);
+    rmsnorm_kernel <<< 1, 1024, 0, stream>>> (o, x, weight, size, elementsPerThread);
 }
 
 void matmul(half* xout, half* x, half* w, int n, int d, int batch = 1, int x_stride = 0, int w_stride = 0, int op_stride = 0, int w_row_stride = -1, float alpha = 1.0f) {
+    if ((n & 7) || (d & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     int serialElements = divUp(n, 32);
     int serialLoads = divUp(serialElements, 8);     // we load 8 elements in parallel
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(d, 4), batch);
     if (w_row_stride == -1) w_row_stride = n;
-    if ((n & 7) || (d & 7))
-        mat_vec_kernel_simple <<<grid_dim, block_dim >>> (xout, x, w, n, d, serialElements, x_stride, w_stride, op_stride, w_row_stride, alpha);
-    else
-        mat_vec_kernel <<<grid_dim, block_dim >>> (xout, x, w, n, d, serialLoads, x_stride, w_stride, op_stride, w_row_stride, alpha);
+    mat_vec_kernel <<<grid_dim, block_dim, 0, stream >>> (xout, x, w, n, d, serialLoads, x_stride, w_stride, op_stride, w_row_stride, alpha);
 }
 
-void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false) {
-    if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(1); }
+void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false, int loff = -1, int *pPos = nullptr) {
+    if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
-    int packed_wt_height = divUp(inpSize, 8);
+    int packed_wt_height = getPackedWeightHeight(inpSize);
     int packed_zeros_height = divUp(scales_height, 8);
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(opSize, 4), 1);
-    mat_vec_kernel_int4 <<<grid_dim, block_dim >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum);
+    mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, loff, pPos);
 }
 
-void RoPERotation(half *q, half *k, int num_heads, int head_size, int pos) {
-    RoPERotation_kernel <<<num_heads, head_size / 2 >>> (q, k, num_heads, head_size, pos);
+void RoPERotation(half *q, half *k, int num_heads, int head_size, int* pPos, int loff) {
+    RoPERotation_kernel <<<num_heads, head_size / 2, 0, stream >>> (q, k, num_heads, head_size, pPos, loff);
 }
 
-void MultiHeadAttention(half *output, half *q, half *key_cache, half * value_cache, half *att, int num_heads, int head_size, int seq_len) {
+void MultiHeadAttention(half *output, half *q, half *key_cache, half * value_cache, half *att, int num_heads, int head_size, int max_seq_len, int *pPos) {
     int dim = head_size * num_heads;
     // 1. Get attention scores
     int serialElements = divUp(head_size, 32);
     dim3 block_dim(32, 32);
-    dim3 grid_dim1(divUp(seq_len, 32), num_heads);
-    mat_vec_kernel_simple <<< grid_dim1, block_dim >>> (att, q, key_cache, head_size, seq_len, serialElements, head_size, head_size, seq_len, dim, 1.0 / sqrt(head_size));
+    dim3 grid_dim1(divUp(max_seq_len, 32), num_heads);      // using max_seq_len instead of real seq_len here has measurable impact on perf (2%) :-/
+    mat_vec_kernel_simple <<< grid_dim1, block_dim, 0, stream >>> (att, q, key_cache, head_size, serialElements, head_size, head_size, dim, 1.0 / sqrt(head_size), pPos);
 
     // 2. Run softmax kernel
-    softmax_kernel <<< num_heads, 1024 >>> (att, num_heads, seq_len);
+    softmax_kernel <<< num_heads, 1024, 0, stream >>> (att, num_heads, pPos);
 
     // 3. weighted sum of the values to get the final result
-    serialElements = divUp(seq_len, 32);    
     dim3 grid_dim2(divUp(head_size, 32), num_heads);
-    vec_mat_kernel <<< grid_dim2, block_dim >>> (output, att, value_cache, head_size, seq_len, serialElements, seq_len, head_size, head_size, dim);
+    vec_mat_kernel <<< grid_dim2, block_dim, 0, stream >>> (output, att, value_cache, head_size, pPos, head_size, head_size, dim);
 }
 
 void siluElementwiseMul(half *hb, half *hb2, int size) {
-   silu_element_wise_mul_kernel <<< divUp(size, 256), 256 >>> (hb, hb2, size);
+   silu_element_wise_mul_kernel <<< divUp(size, 256), 256, 0, stream >>> (hb, hb2, size);
 }
 
-void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
-
-    // a few convenience variables
+void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
     half* x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
     int head_size = dim / p->n_heads;
 
-#if DUMP_PER_TOKEN_TIMINGS == 1
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
-#endif
-
-    // copy the token embedding into x
-    half* content_row = &(w->token_embedding_table[token * dim]);
-    cudaMemcpyAsync(x, content_row, dim * sizeof(half), cudaMemcpyDeviceToDevice);
-
+    copy_embedding_kernel <<<divUp(dim, 256), 256, 0, stream >>> (x, w->token_embedding_table, dim, s->shared_data->tokens, pPos);
+    
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
 
@@ -620,20 +693,18 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // we directly store (key, value) at this time step (pos) to our kv cache
         int loff = l * p->seq_len * dim; // kv cache layer offset for convenience
-        half* key_cache_row = s->key_cache + loff + pos * dim;
-        half* value_cache_row = s->value_cache + loff + pos * dim;
 
-        // qkv matmuls for this position
+        // qkv matmuls for this position (opt: can be done in single kernel as batch of 3)
         matmul(s->q, s->xb, w->layers[l].wq_q, dim, dim);
-        matmul(key_cache_row, s->xb, w->layers[l].wq_k, dim, dim);
-        matmul(value_cache_row, s->xb, w->layers[l].wq_v, dim, dim);
+        matmul(s->key_cache, s->xb, w->layers[l].wq_k, dim, dim, false, loff, pPos);
+        matmul(s->value_cache, s->xb, w->layers[l].wq_v, dim, dim, false, loff, pPos);
 
         // apply RoPE rotation to the q and k vectors for each head
         // also save the output (key, value) at this time step (pos) to our kv cache
-        RoPERotation(s->q, key_cache_row, p->n_heads, head_size, pos);
+        RoPERotation(s->q, s->key_cache, p->n_heads, head_size, pPos, loff);
 
         // apply MHA using the query and the key-value cache
-        MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, pos+1);
+        MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, seq_len_bin, pPos);
 
         // final matmul to get the output of the attention fused with residual connection back into x
         matmul(s->x, s->xb, w->layers[l].wq_o, dim, dim, true);
@@ -647,7 +718,6 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // apply F.silu activation on hb and multiply it with hb2
         siluElementwiseMul(s->hb, s->hb2, hidden_dim);
-
         matmul(s->x, s->hb, w->layers[l].wq_down, hidden_dim, dim, true);
     }
 
@@ -655,13 +725,56 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+}
 
-    // copy logits from GPU->CPU
-    convert_fp16_to_fp32 <<<divUp(p->vocab_size, 256), 256 >>> (s->logits_temp, s->logits_gpu, p->vocab_size);
-    
+#define MAX_GRAPHS 8
+cudaGraphExec_t cudaGraphInstance[MAX_GRAPHS];
+bool graphCaptured[MAX_GRAPHS];
+
+void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits = false) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
-    cudaEventRecord(stop);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, stream);
+#endif
+
+    int seq_len = s->shared_data->pos + 1;
+#if USE_CUDA_GRAPHS
+    int graphIndex;
+    int seq_len_bin = 128;
+    for (graphIndex = 0; graphIndex < MAX_GRAPHS - 1; seq_len_bin *= 2, graphIndex++)
+        if (seq_len <= seq_len_bin) break;
+    if ((seq_len > seq_len_bin) || (graphIndex == MAX_GRAPHS - 1)) seq_len_bin = p->seq_len;    // last bin holds max seq len
+
+    if (!graphCaptured[graphIndex])
+    {
+        cudaGraph_t graph = {};
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        run_llama_network(s->pos, p, s, w, seq_len_bin);
+        cudaStreamEndCapture(stream, &graph);
+        cudaGraphInstantiate(&cudaGraphInstance[graphIndex], graph, 0);
+        cudaGraphDestroy(graph);
+        graphCaptured[graphIndex] = true;
+    }
+    cudaGraphLaunch(cudaGraphInstance[graphIndex], stream);
+#else
+    run_llama_network(s->pos, p, s, w, seq_len);
+#endif
+
+    if (copyLogits) {
+        // copy to the right slot in logits_array (and convert to FP32)
+        // we compute perplexity on the CPU later.
+        float* pOutput = s->logits_array + p->vocab_size * s->shared_data->pos;
+        convert_fp16_to_fp32 << < divUp(p->vocab_size, 128), 128 >> > (pOutput, s->logits, p->vocab_size);
+    }
+
+    // sample the next token using greedy argmax sampling: take the token with the highest probability (not included in the graph because of gen_token variable)
+    argmax_kernel <<<1, 1024, 0, stream>>> (s->logits, p->vocab_size, &(s->shared_data->tokens[0]), &(s->shared_data->pos), s->pos, gen_token);
+
+#if DUMP_PER_TOKEN_TIMINGS == 1
+    cudaEventRecord(stop, stream);
     cudaEventSynchronize(stop);
     float time = 0;
     cudaEventElapsedTime(&time, start, stop);
@@ -669,35 +782,185 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 #endif
-    cudaMemcpy(s->logits, s->logits_temp, p->vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 // ----------------------------------------------------------------------------
-// byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
+// hardcoded for llama models
+constexpr int bos_token = 1;
+constexpr int eos_token = 2;
 
-int str_lookup(char *str, char **vocab, int vocab_size) {
-    // find the first perfect match for str in vocab, return its index or -1 if not found
-    for (int i = 0; i < vocab_size; i++) {
-        if (strcmp(str, vocab[i]) == 0) {
-            return i;
-        }
-    }
-    return -1;
+
+// ----------------------------------------------------------------------------
+// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+
+typedef struct {
+    char* str;
+    int id;
+} TokenIndex;
+
+typedef struct {
+    char** vocab;
+    float* vocab_scores;
+    TokenIndex* sorted_vocab;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512]; // stores all single-byte strings
+} Tokenizer;
+
+int compare_tokens(const void* a, const void* b) {
+    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
-void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, unsigned int max_token_length, int *tokens, int *n_tokens) {
-    
-    // a temporary buffer to merge two consecutive tokens
-    char* str_buffer = (char*) malloc((max_token_length*2+1) * sizeof(char)); // *2 for concat, +1 for null terminator
+void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
+    // i should have written the vocab_size into the tokenizer file... sigh
+    t->vocab_size = vocab_size;
+    // malloc space to hold the scores and the strings
+    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
+    t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
+    t->sorted_vocab = NULL; // initialized lazily
+    for (int i = 0; i < 256; i++) {
+        t->byte_pieces[i * 2] = (unsigned char)i;
+        t->byte_pieces[i * 2 + 1] = '\0';
+    }
+    // read in the file
+    FILE* file = fopen(tokenizer_path, "rb");
+    if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer_path); exit(EXIT_FAILURE); }
+    if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+    int len;
+    for (int i = 0; i < vocab_size; i++) {
+        if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+        if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+        t->vocab[i] = (char*)malloc(len + 1);
+        if (fread(t->vocab[i], len, 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+        t->vocab[i][len] = '\0'; // add the string terminating token
+    }
+    fclose(file);
+}
 
-    // first encode every individual byte in the input string
-    *n_tokens = 0; // the number of tokens
-    for (char *c = text; *c != '\0'; c++) {
-        sprintf(str_buffer, "%c", *c);
-        int id = str_lookup(str_buffer, vocab, vocab_size);
-        if (id == -1) { printf("not good\n"); exit(1);}
-        tokens[*n_tokens] = id;
-        (*n_tokens)++;
+void free_tokenizer(Tokenizer* t) {
+    for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
+    free(t->vocab);
+    free(t->vocab_scores);
+    free(t->sorted_vocab);
+}
+
+char* decode(Tokenizer* t, int prev_token, int token) {
+    char* piece = t->vocab[token];
+    // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
+    if (prev_token == bos_token && piece[0] == ' ') { piece++; }
+    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+    // parse this and convert and return the actual byte
+    unsigned char byte_val;
+    if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+        piece = (char*)t->byte_pieces + byte_val * 2;
+    }
+    return piece;
+}
+
+void safe_printf(char* piece) {
+    // piece might be a raw byte token, and we only want to print printable chars or whitespace
+    // because some of the other bytes can be various control codes, backspace, etc.
+    if (piece == NULL) { return; }
+    if (piece[0] == '\0') { return; }
+    if (piece[1] == '\0') {
+        unsigned char byte_val = piece[0];
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return; // bad byte, don't print it
+        }
+    }
+    printf("%s", piece);
+}
+
+int str_lookup(char* str, TokenIndex* sorted_vocab, int vocab_size) {
+    // efficiently find the perfect match for str in vocab, return its index or -1 if not found
+    TokenIndex tok = { str }; // acts as the key to search for
+    TokenIndex* res = (TokenIndex*) bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    return res != NULL ? res->id : -1;
+}
+
+void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens, int* n_tokens) {
+    // encode the string text (input) into an upper-bound preallocated tokens[] array
+    // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
+    if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
+
+    if (t->sorted_vocab == NULL) {
+        // lazily malloc and sort the vocabulary
+        t->sorted_vocab = (TokenIndex*) malloc(t->vocab_size * sizeof(TokenIndex));
+        for (int i = 0; i < t->vocab_size; i++) {
+            t->sorted_vocab[i].str = t->vocab[i];
+            t->sorted_vocab[i].id = i;
+        }
+        qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
+    }
+
+    // create a temporary buffer that will store merge candidates of always two consecutive tokens
+    // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
+    char* str_buffer = (char *) malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+    size_t str_len = 0;
+
+    // start at 0 tokens
+    *n_tokens = 0;
+
+    // add optional BOS (=1) token, if desired
+    if (bos) tokens[(*n_tokens)++] = bos_token;
+
+    // add_dummy_prefix is true by default
+    // so prepend a dummy prefix token to the input string, but only if text != ""
+    // TODO: pretty sure this isn't correct in the general case but I don't have the
+    // energy to read more of the sentencepiece code to figure out what it's doing
+    if (text[0] != '\0') {
+        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+        tokens[(*n_tokens)++] = dummy_prefix;
+    }
+
+    // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
+    // Code point ↔ UTF-8 conversion
+    // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
+    // U+0000	U+007F	    0xxxxxxx
+    // U+0080	U+07FF	    110xxxxx	10xxxxxx
+    // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
+    // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
+
+    // process the raw (UTF-8) byte sequence of the input string
+    for (char* c = text; *c != '\0'; c++) {
+
+        // reset buffer if the current byte is ASCII or a leading byte
+        // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
+        // 0x80 is 10000000
+        // in UTF-8, all continuation bytes start with "10" in first two bits
+        // so in English this is: "if this byte is not a continuation byte"
+        if ((*c & 0xC0) != 0x80) {
+            // this byte must be either a leading byte (11...) or an ASCII char (0x...)
+            // => reset our location, as we're starting a new UTF-8 codepoint
+            str_len = 0;
+        }
+
+        // append the current byte to the buffer
+        str_buffer[str_len++] = *c; // ++ is post-increment, incremented after this line
+        str_buffer[str_len] = '\0';
+
+        // while the next character is a continuation byte, continue appending
+        // but if there are too many of them, just stop to avoid overruning str_buffer size.
+        if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) {
+            continue;
+        }
+
+        // ok c+1 is not a continuation byte, so we've read in a full codepoint
+        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+
+        if (id != -1) {
+            // we found this codepoint in vocab, add it as a token
+            tokens[(*n_tokens)++] = id;
+        }
+        else {
+            // byte_fallback encoding: just encode each byte as a token
+            // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
+            // so the individual bytes only start at index 3
+            for (int i = 0; i < str_len; i++) {
+                tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
+            }
+        }
+        str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
     }
 
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
@@ -706,13 +969,13 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
         int best_id = -1;
         int best_idx = -1;
 
-        for (int i=0; i < (*n_tokens-1); i++) {
+        for (int i = 0; i < (*n_tokens - 1); i++) {
             // check if we can merge the pair (tokens[i], tokens[i+1])
-            sprintf(str_buffer, "%s%s", vocab[tokens[i]], vocab[tokens[i+1]]);
-            int id = str_lookup(str_buffer, vocab, vocab_size);
-            if (id != -1 && vocab_scores[id] > best_score) {
+            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
+            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+            if (id != -1 && t->vocab_scores[id] > best_score) {
                 // this merge pair exists in vocab! record its score and position
-                best_score = vocab_scores[id];
+                best_score = t->vocab_scores[id];
                 best_id = id;
                 best_idx = i;
             }
@@ -725,11 +988,14 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
         // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
         tokens[best_idx] = best_id;
         // delete token at position best_idx+1, shift the entire sequence back 1
-        for (int i = best_idx+1; i < (*n_tokens-1); i++) {
-            tokens[i] = tokens[i+1];
+        for (int i = best_idx + 1; i < (*n_tokens - 1); i++) {
+            tokens[i] = tokens[i + 1];
         }
         (*n_tokens)--; // token length decreased
     }
+
+    // add optional EOS (=2) token, if desired
+    if (eos) tokens[(*n_tokens)++] = eos_token;
 
     free(str_buffer);
 }
@@ -744,39 +1010,184 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-int argmax(float* v, int n) {
-    // return argmax of v in elements 0..n
-    int max_i = 0;
-    float max_p = v[0];
-    for (int i = 1; i < n; i++) {
-        if (v[i] > max_p) {
-            max_i = i;
-            max_p = v[i];
+
+void softmax(float* x, int size) {
+    // find max value (for numerical stability)
+    float max_val = x[0];
+    for (int i = 1; i < size; i++) {
+        if (x[i] > max_val) {
+            max_val = x[i];
         }
     }
-    return max_i;
+    // exp and sum
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+    // normalize
+    for (int i = 0; i < size; i++) {
+        x[i] /= sum;
+    }
 }
+
+// tokens is an array of integers representing the input text
+// logits is a 2D array of floats representing the predicted probabilities of each token for each possible word in the vocabulary
+// vocab_size is a constant integer representing the size of the vocabulary
+// num_tokens is an integer representing the number of tokens in the input text
+float compute_perplexity(int* tokens, float* logits, int num_tokens, int vocab_size) {
+    // initialize a variable to store the sum of log probabilities
+    double sum = 0.0;
+    // loop through each token in the input text
+    for (int i = 0; i < num_tokens; i++) {
+        // get the index of the actual word in the vocabulary
+        int word_index = tokens[i];
+
+        // the logits that we get from GPU are pre-softmax, need to apply softmax first
+        softmax(&logits[i * vocab_size], vocab_size);
+
+        // get the predicted probability of that word from the logits array
+        double prob = logits[i * vocab_size + word_index];
+
+        //printf(" %g,", prob);
+
+        // add the log probability to the sum
+        sum += log(prob);
+    }
+
+    // compute the average log probability
+    double avg_log_prob = sum / num_tokens;
+    // compute the perplexity as the exponentiation of the negative average log probability
+    return float(exp(-avg_log_prob));
+}
+
+
 // ----------------------------------------------------------------------------
+// max 32 MB dataset supported
+constexpr int DATA_SET_MAX_SIZE = 1024 * 1024 * 32;
+char dataset[DATA_SET_MAX_SIZE];
+int  datasetTokens[DATA_SET_MAX_SIZE];
 
+float get_dataset_perplexity(char* dataset, Tokenizer *tokenizer, Config *config, RunState *state, TransformerWeights *weights) {
+    int bytes = strlen(dataset);
+    printf("\nTokenizing Dataset...");
+    int totalTokens;
+    encode(tokenizer, dataset, 0, 0, datasetTokens, &totalTokens);
+    printf("done!\n");
+
+    printf("Found %d characters, %d tokens", bytes, totalTokens);
+
+    int numTokens = totalTokens;
+    if (numTokens >= config->seq_len) {
+        numTokens = config->seq_len - 1;
+        printf("\nTruncated to %d tokens", numTokens);
+    }
+
+    printf("\nRunning the network to get logits...");
+    // run the transformer model to get logits
+    cudaMemset(state->pos, 0, sizeof(int));
+    state->shared_data->pos = 0;
+    state->shared_data->tokens[0] = bos_token;
+    memcpy(&(state->shared_data->tokens[1]), datasetTokens, sizeof(int) * numTokens);
+    for (int pos = 0; pos < numTokens; pos++) {
+        transformer(false, config, state, weights, true);
+        cudaDeviceSynchronize();
+    }
+    printf("done!\n");
+
+    printf("Computing perplexity...");
+
+    // copy the logits and compute preplexity
+    float* logits_arr = (float*)malloc(numTokens * config->vocab_size * sizeof(float));
+    cudaMemcpy(logits_arr, state->logits_array, numTokens * config->vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    float pplx = compute_perplexity(datasetTokens, logits_arr, numTokens, config->vocab_size);
+
+    printf("\nPerplexity computed on %d tokens: %f\n\n", numTokens, pplx);
+    free(logits_arr);
+
+    return pplx;
+}
+
+
+void parseDataSetAndComputePreplexity(char* textFileName, Tokenizer* tokenizer, Config* config, RunState* state, TransformerWeights* weights)
+{
+    FILE* fp = fopen(textFileName, "rb+");
+    printf("\nLoading Dataset...");
+    int bytes = fread(dataset, 1, DATA_SET_MAX_SIZE, fp);
+    fclose(fp);
+    printf("done!\n");
+    
+    dataset[bytes - 1] = 0;     // null terminate in case it wasn't
+
+    int count = 0;
+    double pplx_product = 1;
+
+    // search for <|endoftext|> and break down the dataset into multiple sequences
+    char* currentSeq = dataset;
+    while (currentSeq) {
+        char* nextseq;
+        if (nextseq = strstr(currentSeq, "<|endoftext|>")) {
+            *nextseq = 0;
+            nextseq += 13;
+            pplx_product *= get_dataset_perplexity(currentSeq, tokenizer, config, state, weights);
+            count++;
+            currentSeq = nextseq;
+        }
+        else {
+            pplx_product *= get_dataset_perplexity(currentSeq, tokenizer, config, state, weights);
+            count++;
+            break;
+        }
+    }
+
+    printf("\nGeomean perplexity on %d sequences: %f\n\n", count , pow(pplx_product, 1.0 / count));
+}
+
+// ----------------------------------------------------------------------------
+void error_usage(char *argv[]) {
+    fprintf(stderr, "Usage:   %s <checkpoint> [options]\n", argv[0]);
+    fprintf(stderr, "Example: %s model.bin -n 256 -i \"Write a poem on GPUs\"\n", argv[0]);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -n <int>    max number of steps to run for, default = max_seq_len\n");
+    fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
+    fprintf(stderr, "  -q <string> compute perplexity on the given dataset file\n");
+    exit(EXIT_FAILURE);
+}
+
+// ----------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
-    // poor man's C argparse
-    char *checkpoint = NULL;  // e.g. out/model.bin
-    int steps = 256;          // max number of steps to run for, 0: use seq_len
-    char *prompt = NULL;      // prompt string
 
-    // 'checkpoint' is necessary arg
-    if (argc < 2) {
-        printf("Usage: %s <checkpoint_file> [steps] [prompt]\n", argv[0]);
-        return 1;
-    }
-    if (argc >= 2) {
-        checkpoint = argv[1];
-    }
-    if (argc >= 3) {
-        steps = atoi(argv[2]);
-    }
-    if (argc >= 4) {
-        prompt = argv[3];
+    // default parameters
+    char* checkpoint_path = NULL;  // e.g. out/model.bin
+    char* tokenizer_path = "tokenizer.bin";
+    char* dataset_path = NULL;
+    int steps = 0;              // number of steps to run for
+    char* prompt = nullptr;     // prompt string
+    bool perplexity = false;
+
+
+    // poor man's C argparse
+    if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(argv); }
+
+    for (int i = 2; i < argc; i += 2) {
+        // do some basic validation
+        if (i + 1 >= argc) { error_usage(argv); } // must have arg after flag
+        if (argv[i][0] != '-') { error_usage(argv); } // must start with dash
+        if (strlen(argv[i]) != 2) { error_usage(argv); } // must be -x (one dash, one letter)
+        // read in the args
+        switch (argv[i][1]) {
+            case 'n': steps = atoi(argv[i + 1]); break;
+            case 'i': prompt = argv[i + 1]; break;
+            case 'z': tokenizer_path = argv[i + 1]; break;
+            case 'q': {
+                dataset_path = argv[i + 1];
+                perplexity = true;
+                break;
+            }
+            default: error_usage(argv);
+        }
     }
 
     // read in the model.bin file
@@ -785,11 +1196,11 @@ int main(int argc, char *argv[]) {
     {
         FILE* file = nullptr;
 
-        file = fopen(checkpoint, "rb");
-        if (!file) { printf("Couldn't open file %s\n", checkpoint); return 1; }
+        file = fopen(checkpoint_path, "rb");
+        if (!file) { printf("Couldn't open file %s\n", checkpoint_path); return 1; }
         // read in the config header
         if (fread(&config, sizeof(Config), 1, file) != 1) { return 1; }
-
+        
         // Dump model config
         printf("\nModel params:- \ndim: %d \nhidden_dim: %d\nn_heads: %d\nn_kv_heads: %d\nn_layers: %d\nseq_len: %d\nvocab_size: %d\n\n",
             config.dim, config.hidden_dim, config.n_heads, config.n_kv_heads, config.n_layers, config.seq_len, config.vocab_size);
@@ -802,76 +1213,63 @@ int main(int argc, char *argv[]) {
     // right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len) { steps = config.seq_len; }
 
-    // read in the tokenizer.bin file
-    char** vocab = (char**)malloc(config.vocab_size * sizeof(char*));
-    float* vocab_scores = (float*)malloc(config.vocab_size * sizeof(float));
-    unsigned int max_token_length;
-    {
-        FILE *file = fopen("tokenizer.bin", "rb");
-        if (!file) { printf("couldn't load tokenizer.bin\n"); return 1; }
-        if (fread(&max_token_length, sizeof(int), 1, file) != 1) { printf("failed read\n"); return 1; }
-        int len;
-        for (int i = 0; i < config.vocab_size; i++) {
-            if (fread(vocab_scores + i, sizeof(float), 1, file) != 1) { printf("failed read\n"); return 1;}
-            if (fread(&len, sizeof(int), 1, file) != 1) { printf("failed read\n"); return 1; }
-            vocab[i] = (char *)malloc(len + 1);
-            if (fread(vocab[i], len, 1, file) != 1) { printf("failed read\n"); return 1; }
-            vocab[i][len] = '\0'; // add the string terminating token
-        }
-        fclose(file);
-    }
+    // create and init the tokenizer
+    Tokenizer tokenizer;
+    build_tokenizer(&tokenizer, tokenizer_path, config.vocab_size);
 
     // create and init the application RunState
     RunState state;
-    malloc_run_state(&state, &config);
+    malloc_run_state(&state, &config, perplexity);
+    cudaStreamCreate(&stream);
 
-    // process the prompt, if any
-    int *prompt_tokens = NULL;
+    int *prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
     int num_prompt_tokens = 0;
-    prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
 
     char input_message[2048];
-    strcpy(input_message, prompt);
+    if (prompt) strcpy(input_message, prompt);
+    else input_message[0] = 0;
 
-    while (1)
-    {
-        if (input_message != NULL) {
-            bpe_encode(input_message, vocab, vocab_scores, config.vocab_size, max_token_length, prompt_tokens, &num_prompt_tokens);
-        }
+    if (perplexity) {
+        parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &config, &state, &weights);
+    } 
+    else
+    while (1) {
+        encode(&tokenizer, input_message, 1, 0, prompt_tokens, &num_prompt_tokens);
+        //printf("\nPrompt tokens: %d - \n", num_prompt_tokens);
+        //for (int i = 0; i < num_prompt_tokens; i++) printf("%d ", prompt_tokens[i]);
+        //printf("\n");
 
         // start the main loop
-        long start = 0;  // used to time our code, only initialized after first iteration
-        int next;        // will store the next token in the sequence
-        int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
-        int pos = 0;     // position in the sequence
+        long start = time_in_ms();  // used to time our code
+        int next;                   // will store the next token in the sequence
+        int token = bos_token;      // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+        int pos = 0;                // position in the sequence
+
+        // copy the prompt tokens into shared list of tokens (so that GPU can access them).
+        // init state
+        cudaMemset(state.pos, 0, sizeof(int));
+        state.shared_data->pos = 0;
+        memcpy(&state.shared_data->tokens, prompt_tokens, sizeof(int) * num_prompt_tokens);
+
         printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
         while (pos < steps) {
+            // wait for GPU work for previous iteration to complete
+            // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
+            cudaStreamSynchronize(stream);
+            // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
+            transformer(pos >= num_prompt_tokens - 1, &config, &state, &weights); // forward the transformer to get next token
 
-            // forward the transformer to get logits for the next token
-            transformer(token, pos, &config, &state, &weights);
+            if (pos > 0)
+            {
+                next = state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
+                char* piece = decode(&tokenizer, token, next);
+                safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+                if (next == eos_token) break; // break if EOS token is reached
 
-            if (pos < num_prompt_tokens) {
-                // if we are still processing the input prompt, force the next prompt token
-                next = prompt_tokens[pos];
+                // advance forward
+                token = next;
             }
-            else {
-                // sample the next token using greedy argmax sampling: take the token with the highest probability
-                next = argmax(state.logits, config.vocab_size);
-            }
-
-            // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
-            char* token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next] + 1 : vocab[next];
-            printf("%s", token_str);
-            //printf(" [%d - %s] ", next, token_str);
-            fflush(stdout);
-
-            if (next == 2) break; // break if EOS token is reached
-
-            // advance forward
-            token = next;
             pos++;
-            // init our timer here because the first iteration could be slow
-            if (start == 0) { start = time_in_ms(); }
         }
 
         // report achieved tok/s
@@ -882,14 +1280,22 @@ int main(int argc, char *argv[]) {
 
         printf("enter next prompt: ");
         fgets(input_message, sizeof(input_message), stdin);
+        // strip newline
+        size_t len = strlen(input_message);
+        if (len > 0 && input_message[len - 1] == '\n') {
+            input_message[len - 1] = '\0';
+        }
     }
 
     // memory cleanup
     free_run_state(&state);
     free_weights(&weights);
-    for (int i = 0; i < config.vocab_size; i++) { free(vocab[i]); }
-    free(vocab);
-    free(vocab_scores);
+#if USE_CUDA_GRAPHS
+    for (int i = 0; i < MAX_GRAPHS; i++)
+        if (graphCaptured[i]) cudaGraphExecDestroy(cudaGraphInstance[i]);
+#endif
+
+    free_tokenizer(&tokenizer);
     if (prompt_tokens != NULL) free(prompt_tokens);
     return 0;
 }
