@@ -51,10 +51,10 @@ float compute_perplexity(int* tokens, float* logits, int num_tokens, int vocab_s
 }
 
 
-void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits = false);
+void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler* pSampler);
 
 // ----------------------------------------------------------------------------
-float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config, RunState* state, TransformerWeights* weights) {
+float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config, RunState* state, TransformerWeights* weights, Sampler *pSampler) {
     int bytes = strlen(dataset);
     int* datasetTokens = (int*)malloc(bytes * sizeof(int));
 
@@ -78,7 +78,7 @@ float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config
     state->shared_data->tokens[0] = bos_token;
     memcpy(&(state->shared_data->tokens[1]), datasetTokens, sizeof(int) * numTokens);
     for (int pos = 0; pos < numTokens; pos++) {
-        transformer(false, config, state, weights, true);
+        transformer(false, config, state, weights, true, pSampler);
         cudaDeviceSynchronize();
     }
     printf("done!\n");
@@ -98,7 +98,7 @@ float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config
 }
 
 
-void parseDataSetAndComputePreplexity(char* textFileName, Tokenizer* tokenizer, Config* config, RunState* state, TransformerWeights* weights)
+void parseDataSetAndComputePreplexity(char* textFileName, Tokenizer* tokenizer, Config* config, RunState* state, TransformerWeights* weights, Sampler *pSampler)
 {
     FILE* fp = fopen(textFileName, "rb+");
     printf("\nLoading Dataset...");
@@ -125,12 +125,12 @@ void parseDataSetAndComputePreplexity(char* textFileName, Tokenizer* tokenizer, 
         if (nextseq = strstr(currentSeq, "<|endoftext|>")) {
             *nextseq = 0;
             nextseq += 13;
-            pplx_product *= get_dataset_perplexity(currentSeq, tokenizer, config, state, weights);
+            pplx_product *= get_dataset_perplexity(currentSeq, tokenizer, config, state, weights, pSampler);
             count++;
             currentSeq = nextseq;
         }
         else {
-            pplx_product *= get_dataset_perplexity(currentSeq, tokenizer, config, state, weights);
+            pplx_product *= get_dataset_perplexity(currentSeq, tokenizer, config, state, weights, pSampler);
             count++;
             break;
         }

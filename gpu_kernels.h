@@ -40,7 +40,7 @@ __global__ void rmsnorm_kernel(half* o, half* x, half* weight, int size, int ele
     __shared__ float shared_ss;
     if (threadIdx.x == 0) {
         ss /= size;
-        ss += 1e-6f;
+        ss += 1e-5f;
         ss = 1.0f / sqrtf(ss);
         shared_ss = ss;
     }
@@ -354,3 +354,95 @@ __global__ void argmax_kernel(half* __restrict__ x, int size, int* result, volat
         *pPosGpu = token_pos;
     }
 }
+
+// This is used for Top-P sampling. We do the following:
+// 1. Divide the logits by temperature
+// 2. Compute softmax
+// 3. Write the indices in an array
+__global__ void softmax_logits_kernel(half* __restrict__ logits, int size, float temperature, int *indices) {
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+
+    
+    for (int t = tid; t < size; t += step)
+    {
+        // first just write the indices array
+        indices[t] = t;
+
+        // divide by temperature
+        float val = (float)logits[t];
+        val /= temperature;
+        logits[t] = (half)val;
+    }
+    __syncthreads();
+
+    // Compute the softmax
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    __shared__ float shared_val;
+
+    // find max value (for numerical stability)
+    float max_val = tid < size ? ((float)logits[tid]) : -FLT_MAX;
+    for (int i = tid + step; i < size; i += step)
+        if ((float)logits[i] > max_val)
+            max_val = logits[i];
+
+    max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    if (threadIdx.x == 0)
+        shared_val = max_val;
+    __syncthreads();
+    max_val = shared_val;
+
+    // exp and sum
+    float sum = 0.0f;
+    for (int i = tid; i < size; i += step) {
+        float v = expf(float(logits[i]) - max_val);
+        logits[i] = (half)v;
+        sum += v;
+    }
+
+    sum = BlockReduce(temp).Sum(sum);
+    if (threadIdx.x == 0)
+        shared_val = sum;
+    __syncthreads();
+    sum = shared_val;
+
+    // normalize and write the result
+    for (int t = tid; t < size; t += step)
+        logits[t] = (half)(float(logits[t]) / sum);
+}
+
+// ----------------------------------------------------------------------------
+
+// find the index in the array that crosses top-p threshold
+__global__ void sample_top_p_kernel(half* sorted_logits_prefix_sum, int* indices, int n, float top_p_threshold, int* result, volatile int* pPos, int* pPosGpu)
+{
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+
+    int min_index = n - 1;
+
+    for (int t = tid; t < n; t += step) {
+        if ((float)(sorted_logits_prefix_sum[t]) >= top_p_threshold) {
+            if (t < min_index) {
+                min_index = t;
+            }
+        }
+    }
+
+    // find the min across the block
+    using BlockReduce = cub::BlockReduce<int, 1024>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    int min_index_global = BlockReduce(temp).Reduce(min_index, cub::Min());
+    if (threadIdx.x == 0)
+    {
+        int token_pos = *pPos;
+        token_pos++;
+        result[token_pos] = indices[min_index_global];
+
+        // update the token indices
+        *pPos = token_pos;
+        *pPosGpu = token_pos;
+    }
+}
+

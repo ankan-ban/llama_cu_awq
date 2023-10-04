@@ -69,3 +69,7 @@ typedef struct {
 
     float* logits_array;  // array of output logits used to compute perplexity (seq_len, vocab_size)
 } RunState;
+
+int divUp(int a, int b) {
+    return (a - 1) / b + 1;
+}

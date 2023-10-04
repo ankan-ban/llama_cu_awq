@@ -25,6 +25,7 @@ Inference for Llama-2 Transformer model in pure Cuda.
 #include "common.h"
 #include "gpu_kernels.h"
 #include "tokenizer.h"
+#include "sampler.h"
 #include "perplexity.h"
 
 constexpr int group_size = 128; // hardcoded for this implementation
@@ -77,10 +78,6 @@ void free_run_state(RunState* s) {
     cudaFree(s->key_cache);
     cudaFree(s->value_cache);
     cudaFreeHost(s->shared_data);
-}
-
-int divUp(int a, int b) {
-    return (a - 1) / b + 1;
 }
 
 size_t getPackedWeightHeight(size_t height)
@@ -314,7 +311,7 @@ constexpr int MAX_GRAPHS = 8;
 cudaGraphExec_t cudaGraphInstance[MAX_GRAPHS];
 bool graphCaptured[MAX_GRAPHS];
 
-void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits) {
+void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -349,11 +346,10 @@ void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, 
         // copy to the right slot in logits_array (and convert to FP32)
         // we compute perplexity on the CPU later.
         float* pOutput = s->logits_array + p->vocab_size * s->shared_data->pos;
-        convert_fp16_to_fp32 << < divUp(p->vocab_size, 128), 128 >> > (pOutput, s->logits, p->vocab_size);
+        convert_fp16_to_fp32 << < divUp(p->vocab_size, 128), 128, 0, stream >> > (pOutput, s->logits, p->vocab_size);
     }
 
-    // sample the next token using greedy argmax sampling: take the token with the highest probability (not included in the graph because of gen_token variable)
-    argmax_kernel <<<1, 1024, 0, stream>>> (s->logits, p->vocab_size, &(s->shared_data->tokens[0]), &(s->shared_data->pos), s->pos, gen_token);
+    sample(pSampler, s, gen_token, stream);
 
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEventRecord(stop, stream);
@@ -383,6 +379,9 @@ void error_usage(char *argv[]) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -n <int>    max number of steps to run for, default = max_seq_len\n");
     fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.6\n");
+    fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -q <string> compute perplexity on the given dataset file\n");
     exit(EXIT_FAILURE);
@@ -398,7 +397,9 @@ int main(int argc, char *argv[]) {
     int steps = 0;              // number of steps to run for
     char* prompt = nullptr;     // prompt string
     bool perplexity = false;
-
+    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float topp = 0.6f;          // top-p in nucleus sampling. 1.0 = off. 0.6 works well, but slower
+    unsigned long long rng_seed = 0; // seed rng with time by default
 
     // poor man's C argparse
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(argv); }
@@ -413,6 +414,9 @@ int main(int argc, char *argv[]) {
             case 'n': steps = atoi(argv[i + 1]); break;
             case 'i': prompt = argv[i + 1]; break;
             case 'z': tokenizer_path = argv[i + 1]; break;
+            case 't': temperature = atof(argv[i + 1]); break;
+            case 'p': topp = atof(argv[i + 1]); break;
+            case 's': rng_seed = atoi(argv[i + 1]); break;
             case 'q': {
                 dataset_path = argv[i + 1];
                 perplexity = true;
@@ -421,6 +425,12 @@ int main(int argc, char *argv[]) {
             default: error_usage(argv);
         }
     }
+
+    // parameter validation/overrides
+    if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
+    if (temperature < 0.0) temperature = 0.0;
+    if (topp < 0.0 || 1.0 < topp) topp = 0.6;
+    if (steps < 0) steps = 0;
 
     // read in the model.bin file
     Config config = {};
@@ -445,6 +455,10 @@ int main(int argc, char *argv[]) {
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, config.vocab_size);
 
+    // build the Sampler
+    Sampler sampler;
+    build_sampler(&sampler, config.vocab_size, temperature, topp, rng_seed);
+
     // create and init the application RunState
     RunState state;
     malloc_run_state(&state, &config, perplexity);
@@ -458,7 +472,7 @@ int main(int argc, char *argv[]) {
     else input_message[0] = 0;
 
     if (perplexity) {
-        parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &config, &state, &weights);
+        parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &config, &state, &weights, &sampler);
     } 
     else
     while (1) {
@@ -485,7 +499,7 @@ int main(int argc, char *argv[]) {
             // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
             cudaStreamSynchronize(stream);
             // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
-            transformer(pos >= num_prompt_tokens - 1, &config, &state, &weights); // forward the transformer to get next token
+            transformer(pos >= num_prompt_tokens - 1, &config, &state, &weights, false, &sampler); // forward the transformer to get next token
 
             if (pos > 0)
             {
