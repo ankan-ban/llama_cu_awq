@@ -43,8 +43,8 @@ void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
     cudaMalloc((void**)&s->q, p->dim * sizeof(half));
     cudaMalloc((void**)&s->att, p->n_heads * p->dim * sizeof(half));
     cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half));
-    cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));    // potentially huge allocs
-    cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));
+    cudaMalloc((void**)&s->key_cache, sizeof(half) * p->n_layers * p->seq_len * p->dim);    // potentially huge allocs
+    cudaMalloc((void**)&s->value_cache, sizeof(half) * p->n_layers * p->seq_len * p->dim);
 
     cudaMalloc((void**)&s->pos, sizeof(int));
     cudaMallocHost((void**)&s->shared_data, sizeof(SharedData));
@@ -58,12 +58,16 @@ void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
     }
 
     if (allocLogitsArray) {
-        cudaMalloc((void**)&s->logits_array, p->seq_len * p->vocab_size * sizeof(float));
+        cudaMalloc((void**)&s->logits_array, sizeof(float) * p->seq_len * p->vocab_size);
         if (!s->logits_array) {
             printf("malloc failed for allocaing logits_array!\n");
             exit(EXIT_FAILURE);
         }
     }
+
+    // HACK: set rope theta based on which model we are trying to run (based on vocab_size)
+    // this is a hack to get around the fact that we don't have it in the config header and changing the header would require changing the weight files
+    s->rope_theta = p->vocab_size == 32016 ? 1000000.0f : 10000.0f;     // codellama models use 1000000.0f, while llama2 models use 10000.0f
 }
 
 void free_run_state(RunState* s) {
@@ -232,8 +236,8 @@ void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum
     mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, loff, pPos);
 }
 
-void RoPERotation(half *q, half *k, int num_heads, int head_size, int* pPos, int loff) {
-    RoPERotation_kernel <<<num_heads, head_size / 2, 0, stream >>> (q, k, num_heads, head_size, pPos, loff);
+void RoPERotation(half *q, half *k, int num_heads, int head_size, int* pPos, int loff, float rope_theta) {
+    RoPERotation_kernel <<<num_heads, head_size / 2, 0, stream >>> (q, k, num_heads, head_size, pPos, loff, rope_theta);
 }
 
 void MultiHeadAttention(half *output, half *q, half *key_cache, half * value_cache, half *att, int num_heads, int head_size, int max_seq_len, int *pPos) {
@@ -280,7 +284,7 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
 
         // apply RoPE rotation to the q and k vectors for each head
         // also save the output (key, value) at this time step (pos) to our kv cache
-        RoPERotation(s->q, s->key_cache, p->n_heads, head_size, pPos, loff);
+        RoPERotation(s->q, s->key_cache, p->n_heads, head_size, pPos, loff, s->rope_theta);
 
         // apply MHA using the query and the key-value cache
         MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, seq_len_bin, pPos);
@@ -379,8 +383,8 @@ void error_usage(char *argv[]) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -n <int>    max number of steps to run for, default = max_seq_len\n");
     fprintf(stderr, "  -i <string> input prompt\n");
-    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
-    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.6\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0.5\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -q <string> compute perplexity on the given dataset file\n");
@@ -397,8 +401,8 @@ int main(int argc, char *argv[]) {
     int steps = 0;              // number of steps to run for
     char* prompt = nullptr;     // prompt string
     bool perplexity = false;
-    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 0.6f;          // top-p in nucleus sampling. 1.0 = off. 0.6 works well, but slower
+    float temperature = 0.5f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float topp = 0.6f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     unsigned long long rng_seed = 0; // seed rng with time by default
 
     // poor man's C argparse
@@ -429,7 +433,7 @@ int main(int argc, char *argv[]) {
     // parameter validation/overrides
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
     if (temperature < 0.0) temperature = 0.0;
-    if (topp < 0.0 || 1.0 < topp) topp = 0.6;
+    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
     if (steps < 0) steps = 0;
 
     // read in the model.bin file

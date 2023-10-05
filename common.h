@@ -11,7 +11,7 @@ typedef struct {
     int n_layers; // number of layers
     int n_heads; // number of query heads
     int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-    int vocab_size; // vocabulary size, usually 256 (byte-level)
+    int vocab_size; // vocabulary size, usually 32000 for llama2 models.
     int seq_len; // max sequence length
 } Config;
 
@@ -68,6 +68,8 @@ typedef struct {
     SharedData* shared_data;
 
     float* logits_array;  // array of output logits used to compute perplexity (seq_len, vocab_size)
+
+    float rope_theta; // theta for the rope rotational embedding. TODO: This really should be part of Config!
 } RunState;
 
 int divUp(int a, int b) {

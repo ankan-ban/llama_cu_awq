@@ -230,7 +230,7 @@ __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half
 }
 
 // Each block processes a single head
-__global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_heads, int head_size, int* pPos, int loff) {
+__global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_heads, int head_size, int* pPos, int loff, float rope_theta) {
     int pos = *pPos;
     half* sk = sk_base + loff + pos * num_heads * head_size;
     int h = blockIdx.x;
@@ -238,7 +238,7 @@ __global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_heads, int 
     half* k = sk + h * head_size;
     int i = threadIdx.x;
     int head_dim = (i * 2) % head_size;
-    float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+    float freq = 1.0f / powf(rope_theta, head_dim / (float)head_size);
     float val = pos * freq;
     float fcr = cosf(val);
     float fci = sinf(val);
