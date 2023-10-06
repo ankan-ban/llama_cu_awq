@@ -4,7 +4,19 @@ Simple and fast Pure Cuda inference for 4-bit [AWQ](https://github.com/mit-han-l
 
 Based on [llama2.c](https://github.com/karpathy/llama2.c)
 
-## Instructions
+## Build
+
+```
+git clone https://github.com/ankan-ban/llama_cu_awq
+cd llama_cu_awq
+mdkir build
+cd build
+cmake ..
+cmake --build . --config Release
+cd ..
+```
+
+## Run
 
 The simpler way is to download a pre-converted model from Huggingface, but you can also do all the steps
 
@@ -18,11 +30,6 @@ You can use one of these models:
 Here are the commands for the 7B model:
 
 ```
-git clone https://github.com/ankan-ban/llama_cu_awq
-cd llama_cu_awq
-gcc weight_packer.cpp -o weight_packer
-nvcc -O3 llama2_q4.cu -o llama2_q4
-
 wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g128-awq/resolve/main/pytorch_model.bin
 wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g128-awq/resolve/main/config.json
 
@@ -36,11 +43,6 @@ python3 convert_awq_to_bin.py pytorch_model.bin output
 And here are the commands for the 13B model:
 
 ```
-git clone https://github.com/ankan-ban/llama_cu_awq
-cd llama_cu_awq
-gcc weight_packer.cpp -o weight_packer
-nvcc -O3 llama2_q4.cu -o llama2_q4
-
 wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/config.json
 wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/pytorch_model-00001-of-00003.bin
 wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq/resolve/main/pytorch_model-00002-of-00003.bin
