@@ -94,7 +94,7 @@ __global__ void mat_vec_kernel(half* op, const half* ip, const half* wt, int n, 
 
 // Simpler version of the above - handles non multiple of 8 dimensions too (used only by MHA block)
 __global__ void mat_vec_kernel_simple(half* op, half* ip, half* wt, int n, int numSerialElements,
-    int ip_stride, int w_stride, int w_row_stride, float alpha, int* pPos) {
+    int ip_stride, int w_stride, int w_row_stride, float alpha, int* pPos, int kv_mul) {
 
     int op_stride = *pPos + 1;
     int index = blockIdx.x * blockDim.y + threadIdx.y;
@@ -102,7 +102,7 @@ __global__ void mat_vec_kernel_simple(half* op, half* ip, half* wt, int n, int n
         return;
 
     const half* __restrict__ input = ip + blockIdx.y * ip_stride;
-    const half* __restrict__ weight = wt + blockIdx.y * w_stride;
+    const half* __restrict__ weight = wt + (blockIdx.y / kv_mul) * w_stride;
     half* output = op + blockIdx.y * op_stride;
 
     float sum = 0;
@@ -177,10 +177,10 @@ __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __res
 
 // Here we make use of shared memory to achieve better memory access pattern, and transpose a 32x32 chunk of the matrix on the fly
 // Again used only by the MHA block
-__global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half* __restrict__ wt, int N, int* pPos, int w_stride, int op_stride, int w_row_stride) {
+__global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half* __restrict__ wt, int N, int* pPos, int w_stride, int op_stride, int w_row_stride, int kv_mul) {
     int K = *pPos + 1;
     const half* __restrict__ input = ip + blockIdx.y * K;
-    const half* __restrict__ weight = wt + blockIdx.y * w_stride;
+    const half* __restrict__ weight = wt + (blockIdx.y / kv_mul) * w_stride;
     half* output = op + blockIdx.y * op_stride;
 
     int start_n = blockIdx.x * 32;
@@ -230,12 +230,11 @@ __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half
 }
 
 // Each block processes a single head
-__global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_heads, int head_size, int* pPos, int loff, float rope_theta) {
+__global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_kv_heads, int head_size, int* pPos, int loff, float rope_theta) {
     int pos = *pPos;
-    half* sk = sk_base + loff + pos * num_heads * head_size;
+
     int h = blockIdx.x;
     half* q = sq + h * head_size;
-    half* k = sk + h * head_size;
     int i = threadIdx.x;
     int head_dim = (i * 2) % head_size;
     float freq = 1.0f / powf(rope_theta, head_dim / (float)head_size);
@@ -244,12 +243,16 @@ __global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_heads, int 
     float fci = sinf(val);
     float q0 = q[i];
     float q1 = q[i + head_size / 2];
-    float k0 = k[i];
-    float k1 = k[i + head_size / 2];
     q[i] = q0 * fcr - q1 * fci;
     q[i + head_size / 2] = q0 * fci + q1 * fcr;
-    k[i] = k0 * fcr - k1 * fci;
-    k[i + head_size / 2] = k0 * fci + k1 * fcr;
+    if (h < num_kv_heads) {
+        half* sk = sk_base + loff + pos * num_kv_heads * head_size;
+        half* k = sk + h * head_size;
+        float k0 = k[i];
+        float k1 = k[i + head_size / 2];
+        k[i] = k0 * fcr - k1 * fci;
+        k[i + head_size / 2] = k0 * fci + k1 * fcr;
+    }
 }
 
 __global__ void softmax_kernel(half* __restrict__ arr, int num_heads, int* pPos) {

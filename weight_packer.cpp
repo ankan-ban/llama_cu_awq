@@ -14,6 +14,7 @@ typedef struct {
     int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
     int vocab_size; // vocabulary size, usually 256 (byte-level)
     int seq_len; // max sequence length
+    float rope_theta; // theta for the rope rotational embedding
 } Config;
 
 
@@ -40,11 +41,11 @@ void getConfig(Config* pConfig, char* json)
     p += strlen("\"num_attention_heads\":");
     pConfig->n_heads = atoi(p);
 
-    p = strstr(json, "\"num_kv_heads\":");
+    p = strstr(json, "\"num_key_value_heads\":");
     if (!p) {
         pConfig->n_kv_heads = pConfig->n_heads;
     } else {
-        p += strlen("\"num_kv_heads\":");
+        p += strlen("\"num_key_value_heads\":");
         pConfig->n_kv_heads = atoi(p);
     }
 
@@ -57,11 +58,18 @@ void getConfig(Config* pConfig, char* json)
     if (!p) { printf("error parsing config.json max_position_embeddings not found"); exit(1); }
     p += strlen("\"max_position_embeddings\":");
     pConfig->seq_len = atoi(p);
+
+    p = strstr(json, "\"rope_theta\":");
+    if (!p) {
+        pConfig->rope_theta = 10000.0f;
+    } else {
+        p += strlen("\"rope_theta\":");
+        pConfig->rope_theta = atof(p);
+    }
+
+    printf("\nModel params:- \ndim: %d \nhidden_dim: %d\nn_heads: %d\nn_kv_heads: %d\nn_layers: %d\nseq_len: %d\nvocab_size: %d\nrope_theta: %g\n",
+        pConfig->dim, pConfig->hidden_dim, pConfig->n_heads, pConfig->n_kv_heads, pConfig->n_layers, pConfig->seq_len, pConfig->vocab_size, pConfig->rope_theta);
 }
-
-
-// the model config
-Config g_config;
 
 void getFileContents(void* buf, char* filename, size_t bytes) {
     FILE* fp = fopen(filename, "rb");
@@ -135,113 +143,152 @@ void repack_q_weights(uint32_t* q_weight_out, uint32_t* q_zeros_out, uint16_t* s
             scales_out[x * meta_height + y] = scales_in[y * width + x];
 }
 
-void repackQWeightByName(FILE *fp, char* fileNameBase, const char* weightName, size_t height, size_t width) {
+void repackQWeightByName(FILE *fp, char* fileNameBase, const char* weightName, size_t height, size_t width, bool needsRepacking) {
     uint32_t* qweight;
     uint32_t* qzeros;
     uint16_t* scales;
 
-    size_t orig_qw_width = divUp(width, 8);                 // eight 4-bit elements packed in single uint32_t
-    size_t orig_meta_height = divUp(height, group_size);    // group-count
+    size_t orig_qweight_bytes = 0;
+    size_t orig_qzeros_bytes = 0;
+    size_t orig_scales_bytes = 0;
 
-    qweight = (uint32_t*)malloc(orig_qw_width * height * sizeof(uint32_t));
-    qzeros = (uint32_t*)malloc(orig_qw_width * orig_meta_height * sizeof(uint32_t));
-    scales = (uint16_t*)malloc(sizeof(uint16_t) * orig_meta_height * width);
-
-    char filename[512];
-    sprintf(filename, "%s.%s.qweight.bin", fileNameBase, weightName);
-    getFileContents(qweight, filename, orig_qw_width * height * sizeof(uint32_t));
-    sprintf(filename, "%s.%s.qzeros.bin", fileNameBase, weightName);
-    getFileContents(qzeros, filename, orig_qw_width * orig_meta_height * sizeof(uint32_t));
-    sprintf(filename, "%s.%s.scales.bin", fileNameBase, weightName);
-    getFileContents(scales, filename, sizeof(uint16_t) * orig_meta_height * width);
-
-    // first convert to weights that are easy to de-quantize with our simple kernel
     int meta_height = divUp(height, group_size);
     int packed_wt_height = divUp(height, 8);
     int packed_zeros_height = divUp(meta_height, 8);
 
-    uint32_t* q_weight_t = (uint32_t*)malloc(packed_wt_height * width * sizeof(uint32_t));
-    uint32_t* q_zeros_t = (uint32_t*)malloc(packed_zeros_height * width * sizeof(uint32_t));
-    uint16_t* scales_t = (uint16_t*)malloc(meta_height * width * sizeof(uint16_t));
+    if (needsRepacking) {
+        size_t orig_qw_width = divUp(width, 8);                 // eight 4-bit elements packed in single uint32_t
+        size_t orig_meta_height = divUp(height, group_size);    // group-count
 
-    repack_q_weights(q_weight_t, q_zeros_t, scales_t, qweight, qzeros, scales, height, width, group_size);
+        orig_qweight_bytes = orig_qw_width * height * sizeof(uint32_t);
+        orig_qzeros_bytes = orig_qw_width * orig_meta_height * sizeof(uint32_t);
+        orig_scales_bytes = orig_meta_height * width * sizeof(uint16_t);
+    } else {
+        int orig_scales_height = packed_zeros_height * 8;        // AWQ repo adds extra padding to scales to make it a multiple of 8
+        orig_qweight_bytes = packed_wt_height * width * sizeof(uint32_t);
+        orig_qzeros_bytes = packed_zeros_height * width * sizeof(uint32_t);
+        orig_scales_bytes = orig_scales_height * width * sizeof(uint16_t);
+    }
 
-    free(qweight);
-    free(qzeros);
-    free(scales);
+    qweight = (uint32_t*)malloc(orig_qweight_bytes);
+    qzeros = (uint32_t*)malloc(orig_qzeros_bytes);
+    scales = (uint16_t*)malloc(orig_scales_bytes);
+
+    char filename[512];
+    sprintf(filename, "%s.%s.qweight.bin", fileNameBase, weightName);
+    getFileContents(qweight, filename, orig_qweight_bytes);
+    sprintf(filename, "%s.%s.qzeros.bin", fileNameBase, weightName);
+    getFileContents(qzeros, filename, orig_qzeros_bytes);
+    sprintf(filename, "%s.%s.scales.bin", fileNameBase, weightName);
+    getFileContents(scales, filename, orig_scales_bytes);
+
+    // first convert to weights that are easy to de-quantize with our simple kernel
+    if (needsRepacking) {
+        uint32_t* q_weight_t = (uint32_t*)malloc(packed_wt_height * width * sizeof(uint32_t));
+        uint32_t* q_zeros_t = (uint32_t*)malloc(packed_zeros_height * width * sizeof(uint32_t));
+        uint16_t* scales_t = (uint16_t*)malloc(meta_height * width * sizeof(uint16_t));
+
+        repack_q_weights(q_weight_t, q_zeros_t, scales_t, qweight, qzeros, scales, height, width, group_size);
+
+        free(qweight);
+        free(qzeros);
+        free(scales);
+
+        qweight = q_weight_t;
+        qzeros = q_zeros_t;
+        scales = scales_t;
+    }
+    else {
+        // AWQ repo adds extra padding to scales to make it a multiple of 8
+        // We need to get rid of that padding
+        int orig_scales_height = packed_zeros_height * 8;
+        uint16_t* scales_t = (uint16_t*)malloc(meta_height * width * sizeof(uint16_t));
+        for (int x = 0; x < width; x++)
+            for (int y = 0; y < meta_height; y++)
+                scales_t[x * meta_height + y] = scales[x * orig_scales_height + y];
+
+        free(scales);
+        scales = scales_t;
+    }
 
     // dump to file
-    if (fwrite(q_weight_t, 1, packed_wt_height * width * sizeof(uint32_t), fp) != packed_wt_height * width * sizeof(uint32_t))  { 
+    if (fwrite(qweight, 1, packed_wt_height * width * sizeof(uint32_t), fp) != packed_wt_height * width * sizeof(uint32_t))  { 
         printf("error writing output q_weights file from input %s", fileNameBase);  exit(1); 
     }
-    if (fwrite(q_zeros_t, 1, packed_zeros_height * width * sizeof(uint32_t), fp) != packed_zeros_height * width * sizeof(uint32_t)) {
+    if (fwrite(qzeros, 1, packed_zeros_height * width * sizeof(uint32_t), fp) != packed_zeros_height * width * sizeof(uint32_t)) {
         printf("error writing output q_zeros file from input %s", fileNameBase);  exit(1);
     }
-    if (fwrite(scales_t, 1, meta_height * width * sizeof(uint16_t), fp) != meta_height * width * sizeof(uint16_t)) {
+    if (fwrite(scales, 1, meta_height * width * sizeof(uint16_t), fp) != meta_height * width * sizeof(uint16_t)) {
         printf("error writing output scales file from input %s", fileNameBase);  exit(1);
     }
 
-    free(q_weight_t);
-    free(q_zeros_t);
-    free(scales_t);
+    if (needsRepacking) {
+        free(qweight);
+        free(qzeros);
+    }
+    free(scales);
 }
 
 char config_json[1024 * 1024];
 int main(int argc, char *argv[])
 {
-    if (argc != 4) { printf("usage: weight_packer <config.json from huggingface> <path_to_awq_bin_weights> <output_bin_filename>\n"); return 0; }
+    if (argc != 5) { printf("usage: weight_packer <config.json from huggingface> <path_to_awq_bin_weights> <output_bin_filename> [OldAwqFormat: 0 or 1]\n"); return 0; }
 
     char *config_file_name = argv[1];
     char* input_dir = argv[2];
     char* op_file_name = argv[3];
+    int old_awq_format = atoi(argv[4]);     // old AWQ format needs weight repacking
 
     // read the config file
+    Config config;
     FILE* fp_config;
     fp_config = fopen(config_file_name, "rb");
     if (!fp_config) { printf("unable to open config file\n"); return 0; }
     if(fread(config_json, 1, sizeof(config_json), fp_config) == 0) { printf("unable to read config file\n"); return 0; }
     fclose(fp_config);
-    getConfig(&g_config, config_json);
+    getConfig(&config, config_json);
 
     FILE* fp;
     fp = fopen(op_file_name, "wb+");
     if (!fp) { printf("unable to open output file\n"); return 0; }
 
     // write the header
-    if (fwrite(&g_config, sizeof(g_config), 1, fp) != 1) { printf("unable to write model metadata\n"); return 0; }
+    if (fwrite(&config, sizeof(config), 1, fp) != 1) { printf("unable to write model metadata\n"); return 0; }
 
     char fileNameBase[512];
     char filename[512];
 
     sprintf(filename, "%s/model.embed_tokens.weight.bin", input_dir);
-    copyInputFileToFile(fp, filename, g_config.vocab_size * g_config.dim * sizeof(uint16_t));
+    copyInputFileToFile(fp, filename, config.vocab_size * config.dim * sizeof(uint16_t));
 
     sprintf(filename, "%s/lm_head.weight.bin", input_dir);
-    copyInputFileToFile(fp, filename, g_config.vocab_size * g_config.dim * sizeof(uint16_t));
+    copyInputFileToFile(fp, filename, config.vocab_size * config.dim * sizeof(uint16_t));
 
     sprintf(filename, "%s/model.norm.weight.bin", input_dir);
-    copyInputFileToFile(fp, filename, g_config.dim * sizeof(uint16_t));
+    copyInputFileToFile(fp, filename, config.dim * sizeof(uint16_t));
 
-    for (int i = 0; i < g_config.n_layers; i++)
+    int kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
+
+    for (int i = 0; i < config.n_layers; i++)
     {
         printf("\nProcessing weights for layer: %d\n", i);
 
         sprintf(fileNameBase, "%s/model.layers.%d", input_dir, i);
 
-        repackQWeightByName(fp, fileNameBase, "self_attn.q_proj", g_config.dim, g_config.dim);
-        repackQWeightByName(fp, fileNameBase, "self_attn.k_proj", g_config.dim, g_config.dim);
-        repackQWeightByName(fp, fileNameBase, "self_attn.v_proj", g_config.dim, g_config.dim);
-        repackQWeightByName(fp, fileNameBase, "self_attn.o_proj", g_config.dim, g_config.dim);
+        repackQWeightByName(fp, fileNameBase, "self_attn.q_proj", config.dim, config.dim, old_awq_format);
+        repackQWeightByName(fp, fileNameBase, "self_attn.k_proj", config.dim, kv_dim, old_awq_format);
+        repackQWeightByName(fp, fileNameBase, "self_attn.v_proj", config.dim, kv_dim, old_awq_format);
+        repackQWeightByName(fp, fileNameBase, "self_attn.o_proj", config.dim, config.dim, old_awq_format);
 
-        repackQWeightByName(fp, fileNameBase, "mlp.up_proj", g_config.dim, g_config.hidden_dim);
-        repackQWeightByName(fp, fileNameBase, "mlp.gate_proj", g_config.dim, g_config.hidden_dim);
-        repackQWeightByName(fp, fileNameBase, "mlp.down_proj", g_config.hidden_dim, g_config.dim);
+        repackQWeightByName(fp, fileNameBase, "mlp.up_proj", config.dim, config.hidden_dim, old_awq_format);
+        repackQWeightByName(fp, fileNameBase, "mlp.gate_proj", config.dim, config.hidden_dim, old_awq_format);
+        repackQWeightByName(fp, fileNameBase, "mlp.down_proj", config.hidden_dim, config.dim, old_awq_format);
 
         sprintf(filename, "%s.input_layernorm.weight.bin", fileNameBase);
-        copyInputFileToFile(fp, filename, g_config.dim * sizeof(uint16_t));
+        copyInputFileToFile(fp, filename, config.dim * sizeof(uint16_t));
 
         sprintf(filename, "%s.post_attention_layernorm.weight.bin", fileNameBase);
-        copyInputFileToFile(fp, filename, g_config.dim * sizeof(uint16_t));
+        copyInputFileToFile(fp, filename, config.dim * sizeof(uint16_t));
     }
 
     printf("\nDone!\n");

@@ -13,6 +13,7 @@ typedef struct {
     int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
     int vocab_size; // vocabulary size, usually 32000 for llama2 models.
     int seq_len; // max sequence length
+    float rope_theta; // theta for the rope rotational embedding
 } Config;
 
 struct QWeight {
@@ -61,15 +62,13 @@ typedef struct {
     half* att; // buffer for scores/attention values (n_heads, seq_len)
     half* logits; // output logits
     // kv cache
-    half* key_cache;   // (layer, seq_len, dim)
-    half* value_cache; // (layer, seq_len, dim)
+    half* key_cache;   // (layer, seq_len, kv_dim)
+    half* value_cache; // (layer, seq_len, kv_dim)
 
     int* pos;  // GPU copy of the current position (just 1 element)
     SharedData* shared_data;
 
     float* logits_array;  // array of output logits used to compute perplexity (seq_len, vocab_size)
-
-    float rope_theta; // theta for the rope rotational embedding. TODO: This really should be part of Config!
 } RunState;
 
 int divUp(int a, int b) {

@@ -35,7 +35,7 @@ wget https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g12
 
 pip install numpy torch
 python3 convert_awq_to_bin.py pytorch_model.bin output
-./weight_packer config.json output llama2-7b-awq-q4.bin
+./weight_packer config.json output llama2-7b-awq-q4.bin 1
 
 ./llama2_q4 llama2-7b-awq-q4.bin -n 256 -i "write an essay about GPUs"
 ```
@@ -53,10 +53,11 @@ python3 convert_awq_to_bin.py pytorch_model-00001-of-00003.bin output
 python3 convert_awq_to_bin.py pytorch_model-00002-of-00003.bin output
 python3 convert_awq_to_bin.py pytorch_model-00003-of-00003.bin output
 
-./weight_packer config.json output llama2-13b-awq-q4.bin
+./weight_packer config.json output llama2-13b-awq-q4.bin 1
 
 ./llama2_q4 llama2-13b-awq-q4.bin -n 256 -i "write an essay about GPUs"
 ```
+Note: the last argument of weight_packer is used to indicate whether the awq weights are using old packing format (that need repacking). If you use latest AWQ repo from github, it will generate weights in new packing format. The weights at https://huggingface.co/abhinavkulkarni/ are still using old format so we are setting the param to 1 above.
 
 
 ### Converting yourself
@@ -76,7 +77,7 @@ python -m awq.entry --model_path /path-to-model/Llama-2-7b-chat-hf --w_bit 4 --q
 
 pip install numpy torch
 python3 convert_awq_to_bin.py awq_weights/llama2-7b-awq.pt output
-./weight_packer config.json output llama2-7b-awq-q4.bin
+./weight_packer config.json output llama2-7b-awq-q4.bin 0
 ```
 
 
