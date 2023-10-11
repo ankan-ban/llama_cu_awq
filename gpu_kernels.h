@@ -256,7 +256,7 @@ __global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_kv_heads, i
 }
 
 __global__ void softmax_kernel(half* __restrict__ arr, int num_heads, int* pPos) {
-    __shared__ float att[MAX_SEQ_LEN];
+    __shared__ float att[MAX_SEQ_LEN_SMEM_KERNEL];
     int h = blockIdx.x;
     int tid = threadIdx.x;
     int step = blockDim.x;
@@ -299,6 +299,51 @@ __global__ void softmax_kernel(half* __restrict__ arr, int num_heads, int* pPos)
     // normalize and write the result
     for (int t = tid; t < size; t += step)
         arr[h * size + t] = (half)(att[t] / sum);
+}
+
+__global__ void softmax_kernel_no_smem(half* arr, int num_heads, int* pPos) {
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+    int size = *pPos + 1;
+
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    __shared__ float shared_val;
+
+    // find max value (for numerical stability)
+    float max_val = tid < size ? (float)arr[h * size + tid] : 0;
+    for (int i = tid + step; i < size; i += step)
+    {
+        float val = (float)arr[h * size + i];
+        if (val > max_val)
+            max_val = val;
+    }
+
+    max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    if (threadIdx.x == 0)
+        shared_val = max_val;
+    __syncthreads();
+    max_val = shared_val;
+
+    // exp and sum
+    float sum = 0.0f;
+    for (int i = tid; i < size; i += step) {
+        float val = (float)arr[h * size + i];
+        val = expf(val - max_val);
+        arr[h * size + i] = (half)val;
+        sum += val;
+    }
+
+    sum = BlockReduce(temp).Sum(sum);
+    if (threadIdx.x == 0)
+        shared_val = sum;
+    __syncthreads();
+    sum = shared_val;
+
+    // normalize and write the result
+    for (int t = tid; t < size; t += step)
+        arr[h * size + t] = (half)(float(arr[h * size + t]) / sum);
 }
 
 __global__ void silu_element_wise_mul_kernel(half* dest, half* src, int size) {

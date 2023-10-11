@@ -248,7 +248,10 @@ void MultiHeadAttention(half *output, half *q, half *key_cache, half * value_cac
     mat_vec_kernel_simple <<< grid_dim1, block_dim, 0, stream >>> (att, q, key_cache, head_size, serialElements, head_size, head_size, dim / kv_mul, 1.0 / sqrt(head_size), pPos, kv_mul);
 
     // 2. Run softmax kernel
-    softmax_kernel <<< num_heads, 1024, 0, stream >>> (att, num_heads, pPos);
+    if (max_seq_len <= MAX_SEQ_LEN_SMEM_KERNEL)
+        softmax_kernel <<< num_heads, 1024, 0, stream >>> (att, num_heads, pPos);
+    else
+        softmax_kernel_no_smem <<< num_heads, 1024, 0, stream >>> (att, num_heads, pPos);
 
     // 3. weighted sum of the values to get the final result
     dim3 grid_dim2(divUp(head_size, 32), num_heads);
@@ -316,7 +319,7 @@ constexpr int MAX_GRAPHS = 8;
 cudaGraphExec_t cudaGraphInstance[MAX_GRAPHS];
 bool graphCaptured[MAX_GRAPHS];
 
-void transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
+void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -377,6 +380,201 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
+
+void build_transformer(Transformer* t, char* checkpoint_path, bool perplexity) {
+    // read in the model.bin file
+    FILE* file = nullptr;
+    file = fopen(checkpoint_path, "rb");
+    if (!file) { printf("Couldn't open file %s\n", checkpoint_path); exit(1); }
+    // read in the config header
+    if (fread(&t->config, sizeof(Config), 1, file) != 1) { printf("Invalid header size\n");  exit(1); }
+    // Dump model config
+    printf("\nModel params:- \ndim: %d \nhidden_dim: %d\nn_heads: %d\nn_kv_heads: %d\nn_layers: %d\nseq_len: %d\nvocab_size: %d\nrope_theta: %g\n",
+        t->config.dim, t->config.hidden_dim, t->config.n_heads, t->config.n_kv_heads, t->config.n_layers, t->config.seq_len, t->config.vocab_size, t->config.rope_theta);
+
+    // read in the Transformer weights
+    malloc_weights(&t->weights, &t->config);
+    if (checkpoint_init_weights(&t->weights, &t->config, file)) { exit(1); }
+
+    malloc_run_state(&t->state, &t->config, perplexity);
+
+    fclose(file);
+}
+
+void free_transformer(Transformer* t) {
+    // free the RunState buffers
+    free_run_state(&t->state);
+    free_weights(&t->weights);
+}
+
+// ----------------------------------------------------------------------------
+// generation loop
+void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps) {
+    char* empty_prompt = "";
+    if (prompt == NULL) { prompt = empty_prompt; }
+
+    // encode the (string) prompt into tokens sequence
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = (int*)malloc((strlen(prompt) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+
+    printf("\nEncoding Prompt... ");   // Encoding can take a long time, print a message to show progress
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    printf("Done!\n");
+
+    if (num_prompt_tokens < 1) {
+        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // start the main loop
+    long start = time_in_ms();    // used to time our code
+    int next;                     // will store the next token in the sequence
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int pos = 0;                  // position in the sequence
+
+    // copy the prompt tokens into shared list of tokens (so that GPU can access them).
+    // init state
+    cudaMemset(transformer->state.pos, 0, sizeof(int));
+    transformer->state.shared_data->pos = 0;
+    memcpy(&transformer->state.shared_data->tokens, prompt_tokens, sizeof(int) * num_prompt_tokens);
+
+    while (pos < steps) {
+        // wait for GPU work for previous iteration to complete
+        // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
+        cudaStreamSynchronize(stream);
+        // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
+        run_transformer(pos >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, false, sampler); // forward the transformer to get next token
+
+        if (pos > 0) {
+            next = transformer->state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
+            char* piece = decode(tokenizer, token, next);
+            safe_printf(piece);             // same as printf("%s", piece), but skips "unsafe" bytes
+            if (next == eos_token) break;   // break if EOS token is reached
+            // advance forward
+            token = next;
+        }
+        pos++;
+    }
+    printf("\n");
+
+    // report achieved tok/s
+    long end = time_in_ms();
+    double time = (end - start) / 1000.0;
+    int timed_tokens = pos - 1;
+    printf("\nachieved tok/s: %f. Tokens: %d, seconds: %g\n", timed_tokens / time, timed_tokens, time);
+
+    free(prompt_tokens);
+}
+
+void read_stdin(const char* guide, char* buffer, size_t bufsize) {
+    // read a line from stdin, up to but not including \n
+    printf("%s", guide);
+    if (fgets(buffer, bufsize, stdin) != NULL) {
+        size_t len = strlen(buffer);
+        if (len > 0 && buffer[len - 1] == '\n') {
+            buffer[len - 1] = '\0'; // strip newline
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// chat loop
+void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
+    char* cli_user_prompt, char* cli_system_prompt, int steps) {
+
+    // buffers for reading the system prompt and user prompt from stdin
+    // you'll notice they are soomewhat haphazardly and unsafely set atm
+    char system_prompt[512];
+    char user_prompt[512];
+    char rendered_prompt[1152];
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
+    int user_idx;
+
+    // start the main loop
+    int8_t user_turn = 1; // user starts
+    int next;        // will store the next token in the sequence
+    int token;       // stores the current token to feed into the transformer
+    int pos = 0;     // position in the sequence
+
+    // init GPU state
+    cudaMemset(transformer->state.pos, pos, sizeof(int));
+    transformer->state.shared_data->pos = pos;
+
+    while (pos < steps) {
+
+        // when it is the user's turn to contribute tokens to the dialog...
+        if (user_turn) {
+            // get the (optional) system prompt at position 0
+            if (pos == 0) {
+                // at position 0, the user can also contribute a system prompt
+                if (cli_system_prompt == NULL) {
+                    // system prompt was not passed in, attempt to get it from stdin
+                    read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
+                }
+                else {
+                    // system prompt was passed in, use it
+                    strcpy(system_prompt, cli_system_prompt);
+                }
+            }
+            // get the user prompt
+            if (pos == 0 && cli_user_prompt != NULL) {
+                // user prompt for position 0 was passed in, use it
+                strcpy(user_prompt, cli_user_prompt);
+            }
+            else {
+                // otherwise get user prompt from stdin
+                read_stdin("User: ", user_prompt, sizeof(user_prompt));
+            }
+            // render user/system prompts into the Llama 2 Chat schema
+            if (pos == 0 && system_prompt[0] != '\0') {
+                char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
+                sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
+            }
+            else {
+                char user_template[] = "[INST] %s [/INST]";
+                sprintf(rendered_prompt, user_template, user_prompt);
+            }
+
+            printf("\nRendered prompt: %s\n", rendered_prompt); // Ankan - test!
+
+            // encode the rendered prompt into tokens
+            encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+            user_idx = 0; // reset the user index
+            user_turn = 0;
+            printf("Assistant: ");
+
+            // copy encoded tokens to GPU
+            memcpy(&transformer->state.shared_data->tokens[pos], prompt_tokens, sizeof(int) * num_prompt_tokens);
+        }
+
+        // wait for GPU work for previous iteration to complete
+        // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
+        cudaStreamSynchronize(stream);
+        run_transformer(user_idx >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, false, sampler); // forward the transformer to get next token
+
+        user_idx++;
+
+        if (user_idx > 0) {
+            next = transformer->state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
+            if (next == eos_token) { 
+                user_turn = 1;  // EOS token ends the Assistant turn
+                printf("\n");
+            } 
+            else if (user_idx > num_prompt_tokens) {
+                char* piece = decode(tokenizer, token, next);
+                safe_printf(piece);
+            }
+
+            // advance forward
+            token = next;
+        }
+        pos++;
+    }
+    printf("\n");
+    free(prompt_tokens);
+}
+
 // ----------------------------------------------------------------------------
 void error_usage(char *argv[]) {
     fprintf(stderr, "Usage:   %s <checkpoint> [options]\n", argv[0]);
@@ -384,11 +582,14 @@ void error_usage(char *argv[]) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -n <int>    max number of steps to run for, default = max_seq_len\n");
     fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -f <string> path to file containing input prompt. Can be used with for multi-line prompts.\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0.5\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-    fprintf(stderr, "  -q <string> compute perplexity on the given dataset file\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat|perplexity, default: generate\n");
+    fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -q <string> dataset file for computing perplexity\n");
     exit(EXIT_FAILURE);
 }
 
@@ -405,6 +606,8 @@ int main(int argc, char *argv[]) {
     float temperature = 0.5f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.6f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     unsigned long long rng_seed = 0; // seed rng with time by default
+    char* mode = "generate";    // generate|chat
+    char* system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(argv); }
@@ -422,127 +625,69 @@ int main(int argc, char *argv[]) {
             case 't': temperature = atof(argv[i + 1]); break;
             case 'p': topp = atof(argv[i + 1]); break;
             case 's': rng_seed = atoi(argv[i + 1]); break;
+            case 'm': mode = argv[i + 1]; break;
+            case 'y': system_prompt = argv[i + 1]; break;
             case 'q': {
                 dataset_path = argv[i + 1];
-                perplexity = true;
+                break;
+            }
+            case 'f': {
+                FILE* file = fopen(argv[i + 1], "r");
+                if (!file) { printf("Couldn't open file %s\n", argv[i + 1]); exit(1); }
+                fseek(file, 0, SEEK_END);
+                long fsize = ftell(file);
+                fseek(file, 0, SEEK_SET);
+                if (prompt) { printf("Warning: -f overrides -i\n"); }
+                prompt = (char*)malloc(fsize + 1);
+                fread(prompt, fsize, 1, file);
+                fclose(file);
+                prompt[fsize] = 0;
                 break;
             }
             default: error_usage(argv);
         }
     }
 
+    if (strcmp(mode, "perplexity") == 0) perplexity = true;
+
     // parameter validation/overrides
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
-    if (steps < 0) steps = 0;
+    if (!perplexity && dataset_path)
+        printf("Warning: dataset path is ignored in non-perplexity mode\n");
 
-    // read in the model.bin file
-    Config config = {};
-    TransformerWeights weights;
-    FILE* file = nullptr;
-    file = fopen(checkpoint_path, "rb");
-    if (!file) { printf("Couldn't open file %s\n", checkpoint_path); return 1; }
-    // read in the config header
-    if (fread(&config, sizeof(Config), 1, file) != 1) { return 1; }
-    // Dump model config
-    printf("\nModel params:- \ndim: %d \nhidden_dim: %d\nn_heads: %d\nn_kv_heads: %d\nn_layers: %d\nseq_len: %d\nvocab_size: %d\nrope_theta: %g\n",
-            config.dim, config.hidden_dim, config.n_heads, config.n_kv_heads, config.n_layers, config.seq_len, config.vocab_size, config.rope_theta);
-    config.vocab_size = abs(config.vocab_size);
-    // read in the Transformer weights
-    malloc_weights(&weights, &config);
-    if (checkpoint_init_weights(&weights, &config, file)) { return 1; }
-
-    // right now we cannot run for more than config.seq_len steps
-    if (steps <= 0 || steps > config.seq_len) { steps = config.seq_len; }
+    // build the Transformer via the model .bin file
+    Transformer transformer;
+    build_transformer(&transformer, checkpoint_path, perplexity);
+    if (steps <= 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
 
     // create and init the tokenizer
     Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, config.vocab_size);
+    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
     // build the Sampler
     Sampler sampler;
-    build_sampler(&sampler, config.vocab_size, temperature, topp, rng_seed);
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
-    // create and init the application RunState
-    RunState state;
-    malloc_run_state(&state, &config, perplexity);
     cudaStreamCreate(&stream);
 
-    int *prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
-    int num_prompt_tokens = 0;
-
-    char input_message[2048];
-    if (prompt) strcpy(input_message, prompt);
-    else input_message[0] = 0;
-
-    if (perplexity) {
-        parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &config, &state, &weights, &sampler);
-    } 
+    if (perplexity)
+        parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &transformer.config, &transformer.state, &transformer.weights, &sampler);
+    else if (strcmp(mode, "generate") == 0)
+        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    else if (strcmp(mode, "chat") == 0)
+        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     else
-    while (1) {
-        encode(&tokenizer, input_message, 1, 0, prompt_tokens, &num_prompt_tokens);
-        //printf("\nPrompt tokens: %d - \n", num_prompt_tokens);
-        //for (int i = 0; i < num_prompt_tokens; i++) printf("%d ", prompt_tokens[i]);
-        //printf("\n");
-
-        // start the main loop
-        long start = time_in_ms();  // used to time our code
-        int next;                   // will store the next token in the sequence
-        int token = bos_token;      // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
-        int pos = 0;                // position in the sequence
-
-        // copy the prompt tokens into shared list of tokens (so that GPU can access them).
-        // init state
-        cudaMemset(state.pos, 0, sizeof(int));
-        state.shared_data->pos = 0;
-        memcpy(&state.shared_data->tokens, prompt_tokens, sizeof(int) * num_prompt_tokens);
-
-        printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
-        while (pos < steps) {
-            // wait for GPU work for previous iteration to complete
-            // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
-            cudaStreamSynchronize(stream);
-            // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
-            transformer(pos >= num_prompt_tokens - 1, &config, &state, &weights, false, &sampler); // forward the transformer to get next token
-
-            if (pos > 0)
-            {
-                next = state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
-                char* piece = decode(&tokenizer, token, next);
-                safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-                if (next == eos_token) break; // break if EOS token is reached
-
-                // advance forward
-                token = next;
-            }
-            pos++;
-        }
-
-        // report achieved tok/s
-        long end = time_in_ms();
-        double time = (end - start) / 1000.0;
-        int timed_tokens = pos - 1;
-        printf("\nachieved tok/s: %f. Tokens: %d, seconds: %g\n", timed_tokens / time, timed_tokens, time);
-
-        printf("enter next prompt: ");
-        fgets(input_message, sizeof(input_message), stdin);
-        // strip newline
-        size_t len = strlen(input_message);
-        if (len > 0 && input_message[len - 1] == '\n') {
-            input_message[len - 1] = '\0';
-        }
-    }
+        error_usage(argv);
 
     // memory cleanup
-    free_run_state(&state);
-    free_weights(&weights);
+    free_transformer(&transformer);
 #if USE_CUDA_GRAPHS
     for (int i = 0; i < MAX_GRAPHS; i++)
         if (graphCaptured[i]) cudaGraphExecDestroy(cudaGraphInstance[i]);
 #endif
 
     free_tokenizer(&tokenizer);
-    if (prompt_tokens != NULL) free(prompt_tokens);
     return 0;
 }

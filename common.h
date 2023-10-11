@@ -3,7 +3,8 @@
 #include <stdint.h>
 #include <cuda_fp16.h>
 
-constexpr int MAX_SEQ_LEN = 8192;
+constexpr int MAX_SEQ_LEN_SMEM_KERNEL = 8192; // 8k is the max sequence length supported by the kernel that uses shared memory
+constexpr int MAX_SEQ_LEN = 128 * 1024;       // Can be arbitirarily large, but we need to allocate memory for the whole sequence
 
 typedef struct {
     int dim; // transformer dimension
@@ -70,6 +71,12 @@ typedef struct {
 
     float* logits_array;  // array of output logits used to compute perplexity (seq_len, vocab_size)
 } RunState;
+
+typedef struct {
+    Config config; // the hyperparameters of the architecture (the blueprint)
+    TransformerWeights weights; // the weights of the model
+    RunState state; // buffers for the "wave" of activations in the forward pass
+} Transformer;
 
 int divUp(int a, int b) {
     return (a - 1) / b + 1;
