@@ -235,6 +235,34 @@ void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum
     mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, loff, pPos);
 }
 
+void qkv_matvec(half* q, half *key_cache, half *value_cache, half* x, QWeight& qw, QWeight& kw, QWeight& vw, int inpSize, int opSize, int loff, int* pPos) {
+    if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
+    // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
+    int scales_height = divUp(inpSize, 128);
+    int packed_wt_height = getPackedWeightHeight(inpSize);
+    int packed_zeros_height = divUp(scales_height, 8);
+    dim3 block_dim(32, 4);
+    dim3 grid_dim(divUp(opSize, 4), 3);
+    qkv_matvec_kernel <<<grid_dim, block_dim, 0, stream >>> (q, key_cache, value_cache, x,
+                                                             qw.weight, qw.zeros, qw.scales, 
+                                                             kw.weight, kw.zeros, kw.scales, 
+                                                             vw.weight, vw.zeros, vw.scales, 
+                                                             inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, loff, pPos);
+}
+
+void ffn_matvec_silu(half* xout, half* x, QWeight& gate_w, QWeight& up_w, int inpSize, int opSize) {
+    if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
+    // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
+    int scales_height = divUp(inpSize, 128);
+    int packed_wt_height = getPackedWeightHeight(inpSize);
+    int packed_zeros_height = divUp(scales_height, 8);
+    dim3 block_dim(32, 4);
+    dim3 grid_dim(divUp(opSize, 4), 1);
+    ffn_matvec_silu_kernel <<<grid_dim, block_dim, 0, stream >>> (xout, x, gate_w.weight, gate_w.zeros, gate_w.scales, 
+                                                                  up_w.weight, up_w.zeros, up_w.scales, 
+                                                                  inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height);
+}
+
 void RoPERotation(half *q, half *k, int num_heads, int num_kv_heads, int head_size, int* pPos, int loff, float rope_theta) {
     RoPERotation_kernel <<<num_heads, head_size / 2, 0, stream >>> (q, k, num_kv_heads, head_size, pPos, loff, rope_theta);
 }
@@ -258,10 +286,6 @@ void MultiHeadAttention(half *output, half *q, half *key_cache, half * value_cac
     vec_mat_kernel <<< grid_dim2, block_dim, 0, stream >>> (output, att, value_cache, head_size, pPos, head_size, head_size, dim / kv_mul, kv_mul);
 }
 
-void siluElementwiseMul(half *hb, half *hb2, int size) {
-   silu_element_wise_mul_kernel <<< divUp(size, 256), 256, 0, stream >>> (hb, hb2, size);
-}
-
 void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
     half* x = s->x;
     int dim = p->dim;
@@ -282,9 +306,14 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
 
         // qkv matmuls for this position (opt: can be done in single kernel as batch of 3 - but only when num_kv_heads == num_heads)
-        matmul(s->q, s->xb, w->layers[l].wq_q, dim, dim);
-        matmul(s->key_cache, s->xb, w->layers[l].wq_k, dim, kv_dim, false, loff, pPos);
-        matmul(s->value_cache, s->xb, w->layers[l].wq_v, dim, kv_dim, false, loff, pPos);
+        if (dim == kv_dim) {
+            qkv_matvec(s->q, s->key_cache, s->value_cache, s->xb, w->layers[l].wq_q, w->layers[l].wq_k, w->layers[l].wq_v, dim, dim, loff, pPos);
+        }
+        else {
+            matmul(s->q, s->xb, w->layers[l].wq_q, dim, dim);
+            matmul(s->key_cache, s->xb, w->layers[l].wq_k, dim, kv_dim, false, loff, pPos);
+            matmul(s->value_cache, s->xb, w->layers[l].wq_v, dim, kv_dim, false, loff, pPos);
+        }
 
         // apply RoPE rotation to the q and k vectors for each head
         // also save the output (key, value) at this time step (pos) to our kv cache
@@ -299,12 +328,10 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->layers[l].rms_ffn_weight, dim);
 
-        // apply gate and up proj (opt: can be done in single kernel as batch of 2)
-        matmul(s->hb, s->xb, w->layers[l].wq_gate, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->layers[l].wq_up, dim, hidden_dim);
+        // apply gate proj and up proj and then the silu activation in a single fused kernel
+        ffn_matvec_silu(s->hb, s->xb, w->layers[l].wq_gate, w->layers[l].wq_up, dim, hidden_dim);
 
-        // apply F.silu activation on hb and multiply it with hb2
-        siluElementwiseMul(s->hb, s->hb2, hidden_dim);
+        // final matmul (down proj) to get the output of the ffn fused with residual connection back into x
         matmul(s->x, s->hb, w->layers[l].wq_down, hidden_dim, dim, true);
     }
 
