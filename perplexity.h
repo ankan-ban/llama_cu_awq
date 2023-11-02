@@ -56,7 +56,7 @@ void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights*
 // ----------------------------------------------------------------------------
 float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config, RunState* state, TransformerWeights* weights, Sampler *pSampler) {
     int bytes = strlen(dataset);
-    int* datasetTokens = (int*)malloc(bytes * sizeof(int));
+    int* datasetTokens = &(state->shared_data->tokens[1]);
 
     printf("\nTokenizing Dataset...");
     int totalTokens;
@@ -76,7 +76,6 @@ float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config
     cudaMemset(state->pos, 0, sizeof(int));
     state->shared_data->pos = 0;
     state->shared_data->tokens[0] = bos_token;
-    memcpy(&(state->shared_data->tokens[1]), datasetTokens, sizeof(int) * numTokens);
     for (int pos = 0; pos < numTokens; pos++) {
         run_transformer(false, config, state, weights, true, pSampler);
         cudaDeviceSynchronize();
@@ -93,7 +92,6 @@ float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config
 
     printf("\nPerplexity computed on %d tokens: %f\n\n", numTokens, pplx);
     free(logits_arr);
-    free(datasetTokens);
     return pplx;
 }
 
