@@ -9,5 +9,7 @@ string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${INSTALLED_GPU_CCS_2}")
 string(REPLACE "." "" CUDA_ARCH_LIST "${INSTALLED_GPU_CCS_3}")
 SET(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
 
+add_library(llama2 SHARED library.cu)
+
 add_executable(weight_packer weight_packer.cpp)
 add_executable(llama2_q4 llama2_q4.cu)
