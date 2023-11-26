@@ -14,7 +14,8 @@ class Model:
         self._lib.free_model.restype = None
 
         # Specify the argument types and return type for free_model
-        self._lib.generate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_int]
+        self._handler_func = ctypes.CFUNCTYPE(None, ctypes.c_char_p)
+        self._lib.generate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_int, self._handler_func]
         self._lib.generate.restype = None
 
         # Initialize the Model
@@ -30,11 +31,16 @@ class Model:
             raise RuntimeError("Failed to initialize the model")
 
     def generate(self, prompt, steps):
+        pieces = []
+        def handler(piece):
+            pieces.append(piece.decode('utf-8'))
         self._lib.generate(
             self._model_ptr,
             ctypes.create_string_buffer(prompt.encode('utf-8')),
-            ctypes.c_int(steps)
+            ctypes.c_int(steps),
+            self._handler_func(handler)
         )
+        return ''.join(pieces)
 
     def __del__(self):
         # Free the Model when the object is deleted
@@ -43,4 +49,5 @@ class Model:
 
 # Example usage:
 model = Model("/path/to/model.bin", "tokenizer.bin", 32000, 0.5, 0.6, 1337)
-model.generate("[INST] <<SYS>>\nYou are a helpful assistant\n<</SYS>> Hello how are you today [INST]", 500);
+result = model.generate("[INST] <<SYS>>\nYou are a helpful assistant\n<</SYS>>\n\n Hello how are you today [INST]", 500);
+print(result)

@@ -20,8 +20,40 @@ extern "C" Model* init_model(char* checkpoint_path, char* tokenizer_path, int vo
     return m;
 }
 
-extern "C" void generate(Model* m, char* prompt, int steps) {
-    generate(&m->transformer, &m->tokenizer, &m->sampler, prompt, steps);
+typedef void (*Handler)(char*);
+
+extern "C" void generate(Model* m, char* prompt, int steps, Handler handler) {
+    Tokenizer* tokenizer = &m->tokenizer;
+    Transformer* transformer = &m->transformer;
+    Sampler* sampler = &m->sampler;
+
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = (int*)malloc((strlen(prompt) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+
+    int next;                     // will store the next token in the sequence
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int pos = 0;                  // position in the sequence
+
+    cudaMemset(transformer->state.pos, 0, sizeof(int));
+    transformer->state.shared_data->pos = 0;
+    memcpy(&transformer->state.shared_data->tokens, prompt_tokens, sizeof(int) * num_prompt_tokens);
+
+    while (pos < steps) {
+        cudaStreamSynchronize(stream);
+        run_transformer(pos >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, false, sampler);
+        if (pos > num_prompt_tokens - 1) {
+            next = transformer->state.shared_data->tokens[pos];
+            char* piece = decode(tokenizer, token, next);
+            handler(piece);
+            if (next == eos_token) break;
+            token = next;
+        }
+        pos++;
+    }
+
+    free(prompt_tokens);
 }
 
 extern "C" void free_model(Model* m) {
