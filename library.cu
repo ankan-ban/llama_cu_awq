@@ -35,6 +35,7 @@ extern "C" void generate(Model* m, char* prompt, int steps, Handler handler) {
     int next;                     // will store the next token in the sequence
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;                  // position in the sequence
+    int last = num_prompt_tokens - 1;
 
     cudaMemset(transformer->state.pos, 0, sizeof(int));
     transformer->state.shared_data->pos = 0;
@@ -42,8 +43,8 @@ extern "C" void generate(Model* m, char* prompt, int steps, Handler handler) {
 
     while (pos < steps) {
         cudaStreamSynchronize(stream);
-        run_transformer(pos >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, false, sampler);
-        if (pos > num_prompt_tokens - 1) {
+        run_transformer(pos >= last, &transformer->config, &transformer->state, &transformer->weights, false, sampler);
+        if (pos > last) {
             next = transformer->state.shared_data->tokens[pos];
             char* piece = decode(tokenizer, token, next);
             handler(piece);
