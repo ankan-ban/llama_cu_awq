@@ -125,7 +125,6 @@ void malloc_weights(TransformerWeights* w, Config* p) {
     }
 
     cudaMalloc((void**)&w->rms_final_weight, p->dim * sizeof(half));
-    int head_size = p->dim / p->n_heads;
     cudaMalloc((void**)&w->wcls, p->vocab_size * p->dim * sizeof(half));
 
     // ensure all mallocs went fine
@@ -437,7 +436,7 @@ void free_transformer(Transformer* t) {
 // ----------------------------------------------------------------------------
 // generation loop
 void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps) {
-    char* empty_prompt = "";
+    char empty_prompt[] = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
     // encode the (string) prompt into tokens sequence
@@ -625,7 +624,8 @@ int main(int argc, char *argv[]) {
 
     // default parameters
     char* checkpoint_path = NULL;  // e.g. out/model.bin
-    char* tokenizer_path = "tokenizer.bin";
+    char default_tokenizer_path[] = "tokenizer.bin";
+    char* tokenizer_path = default_tokenizer_path;
     char* dataset_path = NULL;
     int steps = 0;              // number of steps to run for
     char* prompt = nullptr;     // prompt string
@@ -633,7 +633,8 @@ int main(int argc, char *argv[]) {
     float temperature = 0.5f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.6f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char* mode = "generate";    // generate|chat
+    char default_mode[] = "generate";
+    char* mode = default_mode;  // generate|chat
     char* system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse
