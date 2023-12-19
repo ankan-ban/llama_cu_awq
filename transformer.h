@@ -441,6 +441,7 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
 
         if (pos > 0) {
             next = transformer->state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
+            if (next >= transformer->config.vocab_size) next = 0;   // skip garbage tokens (can happen with NANs)
             char* piece = decode(tokenizer, token, next);
             safe_printf(piece);             // same as printf("%s", piece), but skips "unsafe" bytes
             if (next == eos_token) break;   // break if EOS token is reached
