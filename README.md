@@ -4,9 +4,6 @@ Simple and fast Pure Cuda inference for 4-bit [AWQ](https://github.com/mit-han-l
 
 Based on [llama2.c](https://github.com/karpathy/llama2.c)
 
-## sycl / llama2_q4.sycl.cpp
-Sycl inference on **Intel dGPU/iGPU** platforms. More details [here](./sycl)
-
 ## Build
 
 ```
