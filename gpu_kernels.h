@@ -87,7 +87,7 @@ __global__ void rmsnorm_kernel(half* o, half* x, half* weight, int size, int ele
     if (threadIdx.x == 0) {
         ss /= size;
         ss += 1e-5f;
-        ss = 1.0f / sqrtf(ss);
+        ss = rsqrtf(ss);
         shared_ss = ss;
     }
     __syncthreads();
