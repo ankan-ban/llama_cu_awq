@@ -149,7 +149,7 @@ int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f) {
     scratch_size *= sizeof(half);
     void* scratchCpu = malloc(scratch_size);
 
-    printf("\nLoading Weights... ");
+    if (DUMP_DEBUG_INFO) printf("\nLoading Weights... ");
 
     readWeight(w->token_embedding_table, f, p->vocab_size * p->dim * sizeof(half), scratchCpu);
     readWeight(w->wcls, f, p->vocab_size * p->dim * sizeof(half), scratchCpu);
@@ -170,7 +170,7 @@ int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f) {
         readWeight(w->layers[i].rms_ffn_weight, f, p->dim * sizeof(half), scratchCpu);
     }
 
-    printf("done!\n");
+    if (DUMP_DEBUG_INFO) printf("done!\n");
     free(scratchCpu);
     return 0;
 }
@@ -382,9 +382,12 @@ void build_transformer(Transformer* t, char* checkpoint_path, bool perplexity) {
     if (!file) { printf("Couldn't open file %s\n", checkpoint_path); exit(1); }
     // read in the config header
     if (fread(&t->config, sizeof(Config), 1, file) != 1) { printf("Invalid header size\n");  exit(1); }
-    // Dump model config
-    printf("\nModel params:- \ndim: %d \nhidden_dim: %d\nn_heads: %d\nn_kv_heads: %d\nn_layers: %d\nseq_len: %d\nvocab_size: %d\nrope_theta: %g\n",
-        t->config.dim, t->config.hidden_dim, t->config.n_heads, t->config.n_kv_heads, t->config.n_layers, t->config.seq_len, t->config.vocab_size, t->config.rope_theta);
+
+    if (DUMP_DEBUG_INFO) {
+        // Dump model config
+        printf("\nModel params:- \ndim: %d \nhidden_dim: %d\nn_heads: %d\nn_kv_heads: %d\nn_layers: %d\nseq_len: %d\nvocab_size: %d\nrope_theta: %g\n",
+            t->config.dim, t->config.hidden_dim, t->config.n_heads, t->config.n_kv_heads, t->config.n_layers, t->config.seq_len, t->config.vocab_size, t->config.rope_theta);
+    }
 
     // read in the Transformer weights
     malloc_weights(&t->weights, &t->config);
