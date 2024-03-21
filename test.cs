@@ -76,7 +76,7 @@ class Program
 {
     static void Main()
     {
-        Model model = new Model("/path/to/model.bin", "tokenizer.bin", 32000, 0.5f, 0.6f, 1337);
+        Model model = new Model("/path/to/model.bin", "tokenizer.bin", 32000, 0f, 0.6f, 1337);
         string result = model.Generate("[INST] <<SYS>>\nYou are a helpful assistant\n<</SYS>>\n\n Hello how are you today [INST]", 500);
         Console.WriteLine(result);
     }
