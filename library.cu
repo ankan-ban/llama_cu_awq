@@ -46,9 +46,9 @@ extern "C" void generate(Model* m, char* prompt, int steps, Handler handler) {
         run_transformer(pos >= last, &transformer->config, &transformer->state, &transformer->weights, false, sampler);
         if (pos > last) {
             next = transformer->state.shared_data->tokens[pos];
+            if (next == eos_token) break;
             char* piece = decode(tokenizer, token, next);
             handler(piece);
-            if (next == eos_token) break;
             token = next;
         }
         pos++;
