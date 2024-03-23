@@ -5,6 +5,7 @@
 
 constexpr int MAX_SEQ_LEN_SMEM_KERNEL = 8192; // 8k is the max sequence length supported by the kernel that uses shared memory
 constexpr int MAX_SEQ_LEN = 128 * 1024;       // Can be arbitirarily large, but we need to allocate memory for the whole sequence
+constexpr bool DUMP_DEBUG_INFO = false;
 
 typedef struct {
     int dim; // transformer dimension
