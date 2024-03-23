@@ -7,8 +7,9 @@ class Model
     private IntPtr _modelPtr;
     private IntPtr _libHandle;
     private delegate void HandlerDelegate(string piece);
+    private const string llama2_so = "build/libllama2.so";
 
-    [DllImport("build/libllama2.so", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(llama2_so, CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr init_model(
         [MarshalAs(UnmanagedType.LPStr)] string checkpointPath,
         [MarshalAs(UnmanagedType.LPStr)] string tokenizerPath,
@@ -18,10 +19,10 @@ class Model
         ulong rngSeed
     );
 
-    [DllImport("build/libllama2.so", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(llama2_so, CallingConvention = CallingConvention.Cdecl)]
     private static extern void free_model(IntPtr model);
 
-    [DllImport("build/libllama2.so", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(llama2_so, CallingConvention = CallingConvention.Cdecl)]
     private static extern void generate(
         IntPtr model,
         [MarshalAs(UnmanagedType.LPStr)] string prompt,
@@ -31,7 +32,7 @@ class Model
 
     public Model(string checkpointPath, string tokenizerPath, int vocabSize, float temperature, float topp, ulong rngSeed)
     {
-        _libHandle = NativeLibrary.Load("build/libllama2.so");
+        _libHandle = NativeLibrary.Load(llama2_so);
         if (_libHandle == IntPtr.Zero)
             throw new Exception("Failed to load library");
 
