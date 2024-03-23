@@ -20,6 +20,9 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature, float to
 
     // buffer only used with nucleus sampling
     cudaMalloc((void**) & sampler->indices, vocab_size * sizeof(int));
+
+    sampler->temp_storage_bytes_sort = 0;
+    sampler->temp_storage_bytes_scan = 0;
 }
 
 void destroy_sampler(Sampler* sampler) {
