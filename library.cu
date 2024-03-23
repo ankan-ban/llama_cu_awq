@@ -13,6 +13,7 @@ typedef struct Model_t
 
 extern "C" Model* init_model(char* checkpoint_path, char* tokenizer_path, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
     Model* m = (Model*)malloc(sizeof(Model));
+    memset(m, 0, sizeof(Model));
     build_transformer(&m->transformer, checkpoint_path, false);
     build_tokenizer(&m->tokenizer, tokenizer_path, vocab_size);
     build_sampler(&m->sampler, vocab_size, temperature, topp, rng_seed);
