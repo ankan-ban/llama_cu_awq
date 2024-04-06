@@ -223,7 +223,7 @@ void matmul(half* xout, half* x, half* w, int n, int d, int batch = 1, int x_str
     mat_vec_kernel <<<grid_dim, block_dim, 0, stream >>> (xout, x, w, n, d, serialLoads, x_stride, w_stride, op_stride, w_row_stride, alpha);
 }
 
-void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false, int loff = -1, int *pPos = nullptr) {
+void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false, bool offset = false, int *pPos = nullptr) {
     if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
@@ -231,10 +231,10 @@ void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum
     int packed_zeros_height = divUp(scales_height, 8);
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(opSize, 4), 1);
-    mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, loff, pPos);
+    mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, offset, pPos);
 }
 
-void qkv_matvec(half* q, half *key_cache, half *value_cache, half* x, QWeight& qw, QWeight& kw, QWeight& vw, int inpSize, int opSize, int loff, int* pPos) {
+void qkv_matvec(half* q, half *key_cache, half *value_cache, half* x, QWeight& qw, QWeight& kw, QWeight& vw, int inpSize, int opSize, int* pPos) {
     if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
@@ -246,7 +246,7 @@ void qkv_matvec(half* q, half *key_cache, half *value_cache, half* x, QWeight& q
                                                              qw.weight, qw.zeros, qw.scales, 
                                                              kw.weight, kw.zeros, kw.scales, 
                                                              vw.weight, vw.zeros, vw.scales, 
-                                                             inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, loff, pPos);
+                                                             inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, pPos);
 }
 
 void ffn_matvec_silu(half* xout, half* x, QWeight& gate_w, QWeight& up_w, int inpSize, int opSize) {
@@ -262,8 +262,8 @@ void ffn_matvec_silu(half* xout, half* x, QWeight& gate_w, QWeight& up_w, int in
                                                                   inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height);
 }
 
-void RoPERotation(half *q, half *k, int num_heads, int num_kv_heads, int head_size, int* pPos, int loff, float rope_theta) {
-    RoPERotation_kernel <<<num_heads, head_size / 2, 0, stream >>> (q, k, num_kv_heads, head_size, pPos, loff, rope_theta);
+void RoPERotation(half *q, half *k, int num_heads, int num_kv_heads, int head_size, int* pPos, float rope_theta) {
+    RoPERotation_kernel <<<num_heads, head_size / 2, 0, stream >>> (q, k, num_kv_heads, head_size, pPos, rope_theta);
 }
 
 void MultiHeadAttention(half *output, half *q, half *key_cache, half * value_cache, half *att, int num_heads, int head_size, int kv_mul, int max_seq_len, int *pPos) {
@@ -306,17 +306,17 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
 
         // qkv matmuls for this position (opt: can be done in single kernel as batch of 3 - but only when num_kv_heads == num_heads)
         if (dim == kv_dim) {
-            qkv_matvec(s->q, s->key_cache, s->value_cache, s->xb, w->layers[l].wq_q, w->layers[l].wq_k, w->layers[l].wq_v, dim, dim, loff, pPos);
+            qkv_matvec(s->q, s->key_cache + loff, s->value_cache + loff, s->xb, w->layers[l].wq_q, w->layers[l].wq_k, w->layers[l].wq_v, dim, dim, pPos);
         }
         else {
             matmul(s->q, s->xb, w->layers[l].wq_q, dim, dim);
-            matmul(s->key_cache, s->xb, w->layers[l].wq_k, dim, kv_dim, false, loff, pPos);
-            matmul(s->value_cache, s->xb, w->layers[l].wq_v, dim, kv_dim, false, loff, pPos);
+            matmul(s->key_cache + loff, s->xb, w->layers[l].wq_k, dim, kv_dim, false, true, pPos);
+            matmul(s->value_cache + loff, s->xb, w->layers[l].wq_v, dim, kv_dim, false, true, pPos);
         }
 
         // apply RoPE rotation to the q and k vectors for each head
         // also save the output (key, value) at this time step (pos) to our kv cache
-        RoPERotation(s->q, s->key_cache, p->n_heads, p->n_kv_heads, head_size, pPos, loff, p->rope_theta);
+        RoPERotation(s->q, s->key_cache + loff, p->n_heads, p->n_kv_heads, head_size, pPos, p->rope_theta);
 
         // apply MHA using the query and the key-value cache
         MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, kv_mul, seq_len_bin, pPos);

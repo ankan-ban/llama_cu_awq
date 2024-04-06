@@ -212,7 +212,7 @@ __forceinline__ __device__ float get_mat_vec_int4(int index, const half* __restr
 
 __device__ void mat_vec_int4(half* __restrict__ output, const half* __restrict__ input,
     const uint32_t* __restrict__ q_weight, const uint32_t* __restrict__ q_zeros, const half* __restrict__ scales,
-    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, int loff, int* pPos)
+    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, bool offset, int* pPos)
 {
     int index = blockIdx.x * blockDim.y + threadIdx.y;
     if (index >= opElements)
@@ -222,9 +222,8 @@ __device__ void mat_vec_int4(half* __restrict__ output, const half* __restrict__
     float sum = get_mat_vec_int4(index, input, q_weight, q_zeros, scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height);
 
     if (threadIdx.x == 0) {
-        if (loff != -1) {
-            output += loff + (*pPos * opElements);
-        }
+        if (offset)
+            output += (*pPos * opElements);
 
         if (accum)
             sum += (float)output[index];
@@ -234,23 +233,23 @@ __device__ void mat_vec_int4(half* __restrict__ output, const half* __restrict__
 
 __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __restrict__ input,
     const uint32_t* __restrict__ q_weight, const uint32_t* __restrict__ q_zeros, const half* __restrict__ scales,
-    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, int loff, int* pPos)
+    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, bool offset, int* pPos)
 {
-    mat_vec_int4(output, input, q_weight, q_zeros, scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, accum, loff, pPos);
+    mat_vec_int4(output, input, q_weight, q_zeros, scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, accum, offset, pPos);
 }
 
 __global__ void qkv_matvec_kernel(half* __restrict__ q, half* __restrict__ key_cache, half* __restrict__ value_cache, const half* __restrict__ input,
     const uint32_t* __restrict__ q_weight, const uint32_t* __restrict__ q_zeros, const half* __restrict__ q_scales,
     const uint32_t* __restrict__ k_weight, const uint32_t* __restrict__ k_zeros, const half* __restrict__ k_scales,
     const uint32_t* __restrict__ v_weight, const uint32_t* __restrict__ v_zeros, const half* __restrict__ v_scales,
-    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, int loff, int* pPos)
+    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, int* pPos)
 {
     if (blockIdx.y == 0)
-        mat_vec_int4(q, input, q_weight, q_zeros, q_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, -1, nullptr);
+        mat_vec_int4(q, input, q_weight, q_zeros, q_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, false, nullptr);
     else if (blockIdx.y == 1)
-        mat_vec_int4(key_cache, input, k_weight, k_zeros, k_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, loff, pPos);
+        mat_vec_int4(key_cache, input, k_weight, k_zeros, k_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, true, pPos);
     else // if (blockIdx.y == 2)
-        mat_vec_int4(value_cache, input, v_weight, v_zeros, v_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, loff, pPos);
+        mat_vec_int4(value_cache, input, v_weight, v_zeros, v_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, true, pPos);
 }
 
 __global__ void  ffn_matvec_silu_kernel(half* __restrict__ output, const half* __restrict__ input, 
@@ -329,7 +328,7 @@ __global__ void vec_mat_kernel(half* op, const half* __restrict__ ip, const half
 }
 
 // Each block processes a single head
-__global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_kv_heads, int head_size, int* pPos, int loff, float rope_theta) {
+__global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_kv_heads, int head_size, int* pPos, float rope_theta) {
     int pos = *pPos;
 
     int h = blockIdx.x;
@@ -345,7 +344,7 @@ __global__ void RoPERotation_kernel(half* sq, half* sk_base, int num_kv_heads, i
     q[i] = q0 * fcr - q1 * fci;
     q[i + head_size / 2] = q0 * fci + q1 * fcr;
     if (h < num_kv_heads) {
-        half* sk = sk_base + loff + pos * num_kv_heads * head_size;
+        half* sk = sk_base + pos * num_kv_heads * head_size;
         half* k = sk + h * head_size;
         float k0 = k[i];
         float k1 = k[i + head_size / 2];
