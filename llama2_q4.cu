@@ -304,22 +304,25 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
         // we directly store (key, value) at this time step (pos) to our kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
 
+        half* k_offset = s->key_cache + loff;
+        half* v_offset = s->value_cache + loff;
+
         // qkv matmuls for this position (opt: can be done in single kernel as batch of 3 - but only when num_kv_heads == num_heads)
         if (dim == kv_dim) {
-            qkv_matvec(s->q, s->key_cache + loff, s->value_cache + loff, s->xb, w->layers[l].wq_q, w->layers[l].wq_k, w->layers[l].wq_v, dim, dim, pPos);
+            qkv_matvec(s->q, k_offset, v_offset, s->xb, w->layers[l].wq_q, w->layers[l].wq_k, w->layers[l].wq_v, dim, dim, pPos);
         }
         else {
             matmul(s->q, s->xb, w->layers[l].wq_q, dim, dim);
-            matmul(s->key_cache + loff, s->xb, w->layers[l].wq_k, dim, kv_dim, false, true, pPos);
-            matmul(s->value_cache + loff, s->xb, w->layers[l].wq_v, dim, kv_dim, false, true, pPos);
+            matmul(k_offset, s->xb, w->layers[l].wq_k, dim, kv_dim, false, true, pPos);
+            matmul(v_offset, s->xb, w->layers[l].wq_v, dim, kv_dim, false, true, pPos);
         }
 
         // apply RoPE rotation to the q and k vectors for each head
         // also save the output (key, value) at this time step (pos) to our kv cache
-        RoPERotation(s->q, s->key_cache + loff, p->n_heads, p->n_kv_heads, head_size, pPos, p->rope_theta);
+        RoPERotation(s->q, k_offset, p->n_heads, p->n_kv_heads, head_size, pPos, p->rope_theta);
 
         // apply MHA using the query and the key-value cache
-        MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, kv_mul, seq_len_bin, pPos);
+        MultiHeadAttention(s->xb, s->q, k_offset, v_offset, s->att, p->n_heads, head_size, kv_mul, seq_len_bin, pPos);
 
         // final matmul to get the output of the attention fused with residual connection back into x
         matmul(s->x, s->xb, w->layers[l].wq_o, dim, dim, true);
