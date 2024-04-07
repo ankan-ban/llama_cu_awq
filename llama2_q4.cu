@@ -323,11 +323,13 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
 
         half* k_offset = s->key_cache + loff;
         half* v_offset = s->value_cache + loff;
-        half* k_swap_offset = m->k_swap_mem + loff;
-        half* v_swap_offset = m->v_swap_mem + loff;
+
+        int coff = (l - m->swap_point) * p->seq_len * kv_dim;
+        half* k_swap_offset = m->k_swap_mem + coff;
+        half* v_swap_offset = m->v_swap_mem + coff;
 
         if (l >= m->swap_point) {
-            //printf("\nswap cache on layer: %d\n", l);
+            //printf("\nswap cache on layer: %d to host offset %d\n", l, (l - m->swap_point));
             // copy host kv cache into 'scratch layer' on the device
             k_offset = s->key_scratch;
             v_offset = s->value_scratch;
