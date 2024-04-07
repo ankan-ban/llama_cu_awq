@@ -751,7 +751,7 @@ int main(int argc, char *argv[]) {
         printf("Warning: dataset path is ignored in non-perplexity mode\n");
 
     // The number of layers to swap kv caches to the host
-    const int swap_layers = 4;
+    const int swap_layers = 10;
 
     // build the Transformer via the model .bin file
     Transformer transformer;
