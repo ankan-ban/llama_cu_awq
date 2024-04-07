@@ -82,7 +82,7 @@ void malloc_run_state(RunState* s, Config* p, int swap_layers, bool allocLogitsA
     }
 }
 
-void free_run_state(RunState* s) {
+void free_run_state(RunState* s, int swap_layers) {
     cudaFree(s->x);
     cudaFree(s->xb);
     cudaFree(s->pos);
@@ -94,6 +94,11 @@ void free_run_state(RunState* s) {
     cudaFree(s->key_cache);
     cudaFree(s->value_cache);
     cudaFreeHost(s->shared_data);
+
+    if (swap_layers > 0) {
+        cudaFree(s->key_scratch);
+        cudaFree(s->value_scratch);
+    }
 }
 
 size_t getPackedWeightHeight(size_t height)
@@ -463,9 +468,9 @@ void build_transformer(Transformer* t, int swap_layers, char* checkpoint_path, b
     fclose(file);
 }
 
-void free_transformer(Transformer* t) {
+void free_transformer(Transformer* t, int swap_layers) {
     // free the RunState buffers
-    free_run_state(&t->state);
+    free_run_state(&t->state, swap_layers);
     free_weights(&t->weights);
 }
 
@@ -484,8 +489,8 @@ void build_swap(Swap* m, Config* p, int swap_layers)
 
 void free_swap(Swap* m)
 {
-    cudaFree(m->k_swap_mem);
-    cudaFree(m->v_swap_mem);
+    cudaFreeHost(m->k_swap_mem);
+    cudaFreeHost(m->v_swap_mem);
 }
 
 // ----------------------------------------------------------------------------
@@ -775,7 +780,7 @@ int main(int argc, char *argv[]) {
     free_swap(&swap);
 
     // memory cleanup
-    free_transformer(&transformer);
+    free_transformer(&transformer, swap_layers);
 #if USE_CUDA_GRAPHS
     for (int i = 0; i < MAX_GRAPHS; i++)
         if (graphCaptured[i]) cudaGraphExecDestroy(cudaGraphInstance[i]);
