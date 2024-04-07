@@ -83,7 +83,7 @@ typedef struct {
 
 typedef struct {
     int swap_point;
-    size_t swap_size;
+    size_t l_swap_size;
     half* k_swap_mem;
     half* v_swap_mem;
 } Swap;

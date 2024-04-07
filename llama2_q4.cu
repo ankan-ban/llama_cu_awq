@@ -333,8 +333,8 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
             // copy host kv cache into 'scratch layer' on the device
             k_offset = s->key_scratch;
             v_offset = s->value_scratch;
-            cudaMemcpyAsync(k_offset, k_swap_offset, m->swap_size, cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(v_offset, v_swap_offset, m->swap_size, cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(k_offset, k_swap_offset, m->l_swap_size, cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(v_offset, v_swap_offset, m->l_swap_size, cudaMemcpyHostToDevice, stream);
         }
 
         // attention rmsnorm
@@ -360,8 +360,8 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
         if (l >= m->swap_point)
         {
             //copy device kv cache data back to host
-            cudaMemcpyAsync(k_swap_offset, k_offset, m->swap_size, cudaMemcpyDeviceToHost, stream);
-            cudaMemcpyAsync(v_swap_offset, v_offset, m->swap_size, cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(k_swap_offset, k_offset, m->l_swap_size, cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(v_swap_offset, v_offset, m->l_swap_size, cudaMemcpyDeviceToHost, stream);
         }
 
         // final matmul to get the output of the attention fused with residual connection back into x
@@ -480,13 +480,15 @@ void build_swap(Swap* m, Config* p, int swap_layers)
 {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     m->swap_point = p->n_layers - swap_layers;
-    m->swap_size = sizeof(half) * swap_layers * p->seq_len * kv_dim;
+    size_t swap_size = sizeof(half) * swap_layers * p->seq_len * kv_dim;
 
-    cudaMallocHost((void**)&m->k_swap_mem, m->swap_size);
-    cudaMallocHost((void**)&m->v_swap_mem, m->swap_size);
+    cudaMallocHost((void**)&m->k_swap_mem, swap_size);
+    cudaMallocHost((void**)&m->v_swap_mem, swap_size);
 
-    cudaMemset(m->k_swap_mem, 0, m->swap_size);
-    cudaMemset(m->v_swap_mem, 0, m->swap_size);
+    cudaMemset(m->k_swap_mem, 0, swap_size);
+    cudaMemset(m->v_swap_mem, 0, swap_size);
+
+    m->l_swap_size = swap_size / swap_layers;
 }
 
 void free_swap(Swap* m)
