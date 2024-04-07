@@ -480,15 +480,15 @@ void build_swap(Swap* m, Config* p, int swap_layers)
 {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     m->swap_point = p->n_layers - swap_layers;
-    size_t swap_size = sizeof(half) * swap_layers * p->seq_len * kv_dim;
+
+    m->l_swap_size = sizeof(half) * p->seq_len * kv_dim;
+    size_t swap_size = swap_layers * m->l_swap_size;
 
     cudaMallocHost((void**)&m->k_swap_mem, swap_size);
     cudaMallocHost((void**)&m->v_swap_mem, swap_size);
 
     cudaMemset(m->k_swap_mem, 0, swap_size);
     cudaMemset(m->v_swap_mem, 0, swap_size);
-
-    m->l_swap_size = swap_size / swap_layers;
 }
 
 void free_swap(Swap* m)
