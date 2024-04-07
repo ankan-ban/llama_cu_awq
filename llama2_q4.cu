@@ -35,7 +35,7 @@ constexpr int group_size = 128; // hardcoded for this implementation
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
-void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
+void malloc_run_state(RunState* s, Config* p, int swap_layers, bool allocLogitsArray) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     cudaMalloc((void**)&s->x, p->dim * sizeof(half));
     cudaMalloc((void**)&s->xb, p->dim * sizeof(half));
@@ -44,9 +44,23 @@ void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
     cudaMalloc((void**)&s->q, p->dim * sizeof(half));
     cudaMalloc((void**)&s->att, p->n_heads * p->dim * sizeof(half));
     cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half));
-    int n_layers = p->n_layers + 1;
-    cudaMalloc((void**)&s->key_cache, sizeof(half) * n_layers * p->seq_len * kv_dim);    // potentially huge allocs
-    cudaMalloc((void**)&s->value_cache, sizeof(half) * n_layers * p->seq_len * kv_dim);
+
+    int n_used_layers = p->n_layers - swap_layers;
+    cudaMalloc((void**)&s->key_cache, sizeof(half) * n_used_layers * p->seq_len * kv_dim);    // potentially huge allocs
+    cudaMalloc((void**)&s->value_cache, sizeof(half) * n_used_layers * p->seq_len * kv_dim);
+
+    if (swap_layers > 0) {
+        cudaMalloc((void**)&s->key_scratch, sizeof(half) * p->seq_len * kv_dim);
+        cudaMalloc((void**)&s->value_scratch, sizeof(half) * p->seq_len * kv_dim);
+
+        if (!s->key_scratch || !s->value_scratch) {
+            printf("malloc failed for allocating swap\n");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        s->key_scratch = nullptr;
+        s->value_scratch = nullptr;
+    }
 
     cudaMalloc((void**)&s->pos, sizeof(int));
     cudaMallocHost((void**)&s->shared_data, sizeof(SharedData));
@@ -300,7 +314,7 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
     for (int l = 0; l < p->n_layers; l++) {
 
         // we directly store (key, value) at this time step (pos) to our kv cache
-        int loff = (l + 1) * p->seq_len * kv_dim; // kv cache layer offset for convenience
+        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
 
         half* k_offset = s->key_cache + loff;
         half* v_offset = s->value_cache + loff;
@@ -309,9 +323,9 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
 
         if (l >= m->swap_point) {
             //printf("\nswap cache on layer: %d\n", l);
-            // copy host kv cache into 'scratch layer' 0 on the device
-            k_offset = s->key_cache;
-            v_offset = s->value_cache;
+            // copy host kv cache into 'scratch layer' on the device
+            k_offset = s->key_scratch;
+            v_offset = s->value_scratch;
             cudaMemcpyAsync(k_offset, k_swap_offset, m->swap_size, cudaMemcpyHostToDevice, stream);
             cudaMemcpyAsync(v_offset, v_swap_offset, m->swap_size, cudaMemcpyHostToDevice, stream);
         }
@@ -429,7 +443,7 @@ long time_in_ms() {
 }
 
 
-void build_transformer(Transformer* t, char* checkpoint_path, bool perplexity) {
+void build_transformer(Transformer* t, int swap_layers, char* checkpoint_path, bool perplexity) {
     // read in the model.bin file
     FILE* file = nullptr;
     file = fopen(checkpoint_path, "rb");
@@ -444,7 +458,7 @@ void build_transformer(Transformer* t, char* checkpoint_path, bool perplexity) {
     malloc_weights(&t->weights, &t->config);
     if (checkpoint_init_weights(&t->weights, &t->config, file)) { exit(1); }
 
-    malloc_run_state(&t->state, &t->config, perplexity);
+    malloc_run_state(&t->state, &t->config, swap_layers, perplexity);
 
     fclose(file);
 }
@@ -727,9 +741,12 @@ int main(int argc, char *argv[]) {
     if (!perplexity && dataset_path)
         printf("Warning: dataset path is ignored in non-perplexity mode\n");
 
+    // The number of layers to swap kv caches to the host
+    const int swap_layers = 4;
+
     // build the Transformer via the model .bin file
     Transformer transformer;
-    build_transformer(&transformer, checkpoint_path, perplexity);
+    build_transformer(&transformer, swap_layers, checkpoint_path, perplexity);
     if (steps <= 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
 
     // create and init the tokenizer
@@ -738,7 +755,7 @@ int main(int argc, char *argv[]) {
 
     // create the swap memory
     Swap swap;
-    build_swap(&swap, &transformer.config, 1);
+    build_swap(&swap, &transformer.config, swap_layers);
 
     // build the Sampler
     Sampler sampler;

@@ -66,6 +66,9 @@ typedef struct {
     half* key_cache;   // (layer, seq_len, kv_dim)
     half* value_cache; // (layer, seq_len, kv_dim)
 
+    half* key_scratch;   // (seq_len, kv_dim)
+    half* value_scratch; // (seq_len, kv_dim)
+
     int* pos;  // GPU copy of the current position (just 1 element)
     SharedData* shared_data;
 
