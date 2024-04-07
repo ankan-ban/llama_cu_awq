@@ -44,8 +44,9 @@ void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
     cudaMalloc((void**)&s->q, p->dim * sizeof(half));
     cudaMalloc((void**)&s->att, p->n_heads * p->dim * sizeof(half));
     cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half));
-    cudaMalloc((void**)&s->key_cache, sizeof(half) * p->n_layers * p->seq_len * kv_dim);    // potentially huge allocs
-    cudaMalloc((void**)&s->value_cache, sizeof(half) * p->n_layers * p->seq_len * kv_dim);
+    int n_layers = p->n_layers + 1;
+    cudaMalloc((void**)&s->key_cache, sizeof(half) * n_layers * p->seq_len * kv_dim);    // potentially huge allocs
+    cudaMalloc((void**)&s->value_cache, sizeof(half) * n_layers * p->seq_len * kv_dim);
 
     cudaMalloc((void**)&s->pos, sizeof(int));
     cudaMallocHost((void**)&s->shared_data, sizeof(SharedData));
@@ -285,7 +286,7 @@ void MultiHeadAttention(half *output, half *q, half *key_cache, half * value_cac
     vec_mat_kernel <<< grid_dim2, block_dim, 0, stream >>> (output, att, value_cache, head_size, pPos, head_size, head_size, dim / kv_mul, kv_mul);
 }
 
-void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
+void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w, Swap* m, int seq_len_bin) {
     half* x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
@@ -298,14 +299,25 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
 
-        // attention rmsnorm
-        rmsnorm(s->xb, x, w->layers[l].rms_att_weight, dim);
-
         // we directly store (key, value) at this time step (pos) to our kv cache
-        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+        int loff = (l + 1) * p->seq_len * kv_dim; // kv cache layer offset for convenience
 
         half* k_offset = s->key_cache + loff;
         half* v_offset = s->value_cache + loff;
+        half* k_swap_offset = m->k_swap_mem + loff;
+        half* v_swap_offset = m->v_swap_mem + loff;
+
+        if (l >= m->swap_point) {
+            //printf("\nswap cache on layer: %d\n", l);
+            // copy host kv cache into 'scratch layer' 0 on the device
+            k_offset = s->key_cache;
+            v_offset = s->value_cache;
+            cudaMemcpyAsync(k_offset, k_swap_offset, m->swap_size, cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(v_offset, v_swap_offset, m->swap_size, cudaMemcpyHostToDevice, stream);
+        }
+
+        // attention rmsnorm
+        rmsnorm(s->xb, x, w->layers[l].rms_att_weight, dim);
 
         // qkv matmuls for this position (opt: can be done in single kernel as batch of 3 - but only when num_kv_heads == num_heads)
         if (dim == kv_dim) {
@@ -323,6 +335,13 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
 
         // apply MHA using the query and the key-value cache
         MultiHeadAttention(s->xb, s->q, k_offset, v_offset, s->att, p->n_heads, head_size, kv_mul, seq_len_bin, pPos);
+
+        if (l >= m->swap_point)
+        {
+            //copy device kv cache data back to host
+            cudaMemcpyAsync(k_swap_offset, k_offset, m->swap_size, cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(v_swap_offset, v_offset, m->swap_size, cudaMemcpyDeviceToHost, stream);
+        }
 
         // final matmul to get the output of the attention fused with residual connection back into x
         matmul(s->x, s->xb, w->layers[l].wq_o, dim, dim, true);
@@ -348,7 +367,7 @@ constexpr int MAX_GRAPHS = 8;
 cudaGraphExec_t cudaGraphInstance[MAX_GRAPHS];
 bool graphCaptured[MAX_GRAPHS];
 
-void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
+void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, Swap* m, bool copyLogits, Sampler *pSampler) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -368,7 +387,7 @@ void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights*
     {
         cudaGraph_t graph = {};
         cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-        run_llama_network(s->pos, p, s, w, seq_len_bin);
+        run_llama_network(s->pos, p, s, w, m, seq_len_bin);
         cudaStreamEndCapture(stream, &graph);
         cudaGraphInstantiate(&cudaGraphInstance[graphIndex], graph, 0);
         cudaGraphDestroy(graph);
@@ -376,7 +395,7 @@ void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights*
     }
     cudaGraphLaunch(cudaGraphInstance[graphIndex], stream);
 #else
-    run_llama_network(s->pos, p, s, w, seq_len);
+    run_llama_network(s->pos, p, s, w, m, seq_len);
 #endif
 
     if (copyLogits) {
@@ -436,9 +455,28 @@ void free_transformer(Transformer* t) {
     free_weights(&t->weights);
 }
 
+void build_swap(Swap* m, Config* p, int swap_layers)
+{
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    m->swap_point = p->n_layers - swap_layers;
+    m->swap_size = sizeof(half) * swap_layers * p->seq_len * kv_dim;
+
+    cudaMallocHost((void**)&m->k_swap_mem, m->swap_size);
+    cudaMallocHost((void**)&m->v_swap_mem, m->swap_size);
+
+    cudaMemset(m->k_swap_mem, 0, m->swap_size);
+    cudaMemset(m->v_swap_mem, 0, m->swap_size);
+}
+
+void free_swap(Swap* m)
+{
+    cudaFree(m->k_swap_mem);
+    cudaFree(m->v_swap_mem);
+}
+
 // ----------------------------------------------------------------------------
 // generation loop
-void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps) {
+void generate(Transformer* transformer, Tokenizer* tokenizer, Swap* m, Sampler* sampler, char* prompt, int steps) {
     char empty_prompt[] = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -472,7 +510,7 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
         // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
         cudaStreamSynchronize(stream);
         // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
-        run_transformer(pos >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, false, sampler); // forward the transformer to get next token
+        run_transformer(pos >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, m, false, sampler); // forward the transformer to get next token
 
         if (pos > 0) {
             next = transformer->state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
@@ -509,7 +547,7 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 
 // ----------------------------------------------------------------------------
 // chat loop
-void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
+void chat(Transformer* transformer, Tokenizer* tokenizer, Swap* m, Sampler* sampler,
     char* cli_user_prompt, char* cli_system_prompt, int steps) {
 
     // buffers for reading the system prompt and user prompt from stdin
@@ -581,7 +619,7 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
         // wait for GPU work for previous iteration to complete
         // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
         cudaStreamSynchronize(stream);
-        run_transformer(user_idx >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, false, sampler); // forward the transformer to get next token
+        run_transformer(user_idx >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, m, false, sampler); // forward the transformer to get next token
 
         user_idx++;
 
@@ -698,6 +736,10 @@ int main(int argc, char *argv[]) {
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
+    // create the swap memory
+    Swap swap;
+    build_swap(&swap, &transformer.config, 1);
+
     // build the Sampler
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
@@ -707,11 +749,13 @@ int main(int argc, char *argv[]) {
     if (perplexity)
         parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &transformer.config, &transformer.state, &transformer.weights, &sampler);
     else if (strcmp(mode, "generate") == 0)
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+        generate(&transformer, &tokenizer, &swap, &sampler, prompt, steps);
     else if (strcmp(mode, "chat") == 0)
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+        chat(&transformer, &tokenizer, &swap, &sampler, prompt, system_prompt, steps);
     else
         error_usage(argv);
+
+    free_swap(&swap);
 
     // memory cleanup
     free_transformer(&transformer);

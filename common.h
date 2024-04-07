@@ -78,6 +78,13 @@ typedef struct {
     RunState state; // buffers for the "wave" of activations in the forward pass
 } Transformer;
 
+typedef struct {
+    int swap_point;
+    size_t swap_size;
+    half* k_swap_mem;
+    half* v_swap_mem;
+} Swap;
+
 int divUp(int a, int b) {
     return (a - 1) / b + 1;
 }
