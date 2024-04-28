@@ -92,7 +92,8 @@ int divUp(int a, int b) {
 // 1. Convert from row-major to col-major
 // 2. Get rid of the order_map (simply pack as little endian)
 void repack_q_data(uint32_t* q_weight_out, const uint32_t* q_weight_in, int height, int width) {
-    uint32_t* temp = (uint32_t*)malloc(width * height * sizeof(uint32_t));
+    size_t temp_size = width * height;
+    uint32_t* temp = (uint32_t*)malloc(temp_size * sizeof(uint32_t));
     int order_map[] = { 0, 2, 4, 6, 1, 3, 5, 7 };   // used by AWQ's original implementation
 
     // 1. convert to uint32 col-major array first (only 4 LSBs of each element are non-zero)
@@ -117,7 +118,11 @@ void repack_q_data(uint32_t* q_weight_out, const uint32_t* q_weight_in, int heig
         for (int y = 0; y < height; y += 8) {
             uint32_t packed_val = 0;
             for (int i = 0; i < 8; i++) {
-                packed_val = (packed_val) | (temp[x * height + y + i] << (4 * i));
+                size_t index = x * height + y + i;
+                if (index >= temp_size) {
+                    fprintf(stderr, "Error: Heap overflow detected at index %zu\n", index);
+                }
+                packed_val = (packed_val) | (temp[index] << (4 * i));
             }
             int packed_wt_y = y / 8;
             q_weight_out[x * packed_wt_height + packed_wt_y] = packed_val;
