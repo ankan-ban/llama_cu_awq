@@ -40,7 +40,6 @@ void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
     cudaMalloc((void**)&s->x, p->dim * sizeof(half));
     cudaMalloc((void**)&s->xb, p->dim * sizeof(half));
     cudaMalloc((void**)&s->hb, p->hidden_dim * sizeof(half));
-    cudaMalloc((void**)&s->hb2, p->hidden_dim * sizeof(half));
     cudaMalloc((void**)&s->q, p->dim * sizeof(half));
     cudaMalloc((void**)&s->att, p->n_heads * p->dim * sizeof(half));
     cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half));
@@ -51,7 +50,7 @@ void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
     cudaMallocHost((void**)&s->shared_data, sizeof(SharedData));
 
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->pos || !s->hb || !s->hb2 || !s->q
+    if (!s->x || !s->xb || !s->pos || !s->hb || !s->q
         || !s->att || !s->logits || !s->key_cache
         || !s->value_cache || !s->shared_data) {
         printf("malloc failed for allocaing run state!\n");
@@ -72,7 +71,6 @@ void free_run_state(RunState* s) {
     cudaFree(s->xb);
     cudaFree(s->pos);
     cudaFree(s->hb);
-    cudaFree(s->hb2);
     cudaFree(s->q);
     cudaFree(s->att);
     cudaFree(s->logits);
