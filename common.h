@@ -58,7 +58,6 @@ typedef struct {
     half* x; // activation at current time stamp (dim,)
     half* xb; // same, but inside a residual branch (dim,)
     half* hb; // buffer for hidden dimension in the ffn (hidden_dim,)
-    half* hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
     half* q; // query (dim,)
     half* att; // buffer for scores/attention values (n_heads, seq_len)
     half* logits; // output logits
